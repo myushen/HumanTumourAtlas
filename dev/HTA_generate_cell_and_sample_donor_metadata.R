@@ -352,43 +352,45 @@ sample_metadata <- sample_metadata |>
          tissue = tolower(tissue),
          sex = ifelse(is.na(sex), "unknown", sex),
          assay = ifelse(is.na(assay), "scRNA-seq", assay) # BETTER NOT HARDCODE HERE
-         )
+         ) |> 
+  
+  select(-Synapse.ID.x, -Synapse.ID.y)
 
+# Sample metadata should contain any clinical annotations from the patient. No subset needed
 
-
-# Subset necessary columns ------------------------------------------------
-cols <- c(
-  "sample_id",
-  "donor_id",
-  "self_reported_ethnicity",
-  "age_days",
-  "tissue",
-  "sex",
-  "assay",
-  "file_id_cellNexus_single_cell",
-  "atlas_id", 
-  #"Biospecimen",
- # "HTAN.Parent.ID",
- # "Source.HTAN.Biospecimen.ID",
-  "diagnosis_age",
-  "primary_diagnosis",
-  "url",
-  "center",
-  "center_id",
-  "title",
-  "Last.Known.Disease.Status",
-  "Progression.or.Recurrence.Type",
-  "Vital.Status",
-  "Cause.of.Death",
-  "Year.Of.Birth",
-  "Year.of.Death",
-  "Year.Of.Diagnosis",
-  "Tumor.Grade",
-  "Progression.or.Recurrence",
-  "Tissue.or.Organ.of.Origin"
-)
-
-sample_metadata <- sample_metadata |> dplyr::select(any_of(cols))
+# # Subset necessary columns ------------------------------------------------
+# cols <- c(
+#   "sample_id",
+#   "donor_id",
+#   "self_reported_ethnicity",
+#   "age_days",
+#   "tissue",
+#   "sex",
+#   "assay",
+#   "file_id_cellNexus_single_cell",
+#   "atlas_id", 
+#   #"Biospecimen",
+#  # "HTAN.Parent.ID",
+#  # "Source.HTAN.Biospecimen.ID",
+#   "diagnosis_age",
+#   "primary_diagnosis",
+#   "url",
+#   "center",
+#   "center_id",
+#   "title",
+#   "Last.Known.Disease.Status",
+#   "Progression.or.Recurrence.Type",
+#   "Vital.Status",
+#   "Cause.of.Death",
+#   "Year.Of.Birth",
+#   "Year.of.Death",
+#   "Year.Of.Diagnosis",
+#   "Tumor.Grade",
+#   "Progression.or.Recurrence",
+#   "Tissue.or.Organ.of.Origin"
+# )
+# 
+# sample_metadata <- sample_metadata |> dplyr::select(any_of(cols))
 
 # sample_metadata |> glimpse()
 # sample_metadata |> dplyr::count(is.na(self_reported_ethnicity), is.na(sex), )
@@ -443,7 +445,7 @@ duckdb_write_parquet <- function(.tbl_sql, path, con) {
 
 save <- duckdb_write_parquet(
   cell_sample_metadata,
-  path = "/vast/scratch/users/shen.m/htan/hta_metadata.0.1.0.parquet",
+  path = "/vast/scratch/users/shen.m/htan/hta_metadata.0.2.0.parquet",
   con = con
 )
 
@@ -458,14 +460,13 @@ library(testthat)
 library(duckdb)
 test_that("get_metadata and get_single_cell_experiment return expected SCE for test sample", {
   
-  cache <- "/vast/scratch/users/shen.m/htan/"
   save_directory <- tempdir()   # or your defined directory
   ids <- c("HTA1_203_332101.h5ad" ,
            "dc1a2e1504a4b71427b682a6300d02d3___1.h5ad") # One of cellNexus file
   
   cell_metadata <-  tbl(
     dbConnect(duckdb::duckdb(), dbdir = ":memory:"),
-    sql("SELECT * FROM read_parquet('/vast/scratch/users/shen.m/htan/hta_metadata.0.1.0.parquet')")
+    sql("SELECT * FROM read_parquet('/vast/scratch/users/shen.m/htan/hta_metadata.0.2.0.parquet')")
   )
   
   # Build test data
@@ -480,12 +481,9 @@ test_that("get_metadata and get_single_cell_experiment return expected SCE for t
     )
   
   # Read metadata and construct SCE
-  sce <- get_metadata(
-    cache_directory = cache,
-    local_metadata = file.path(save_directory, "test_metadata.parquet")
-  ) |>
+  sce <- get_metadata(local_metadata = file.path(save_directory, "test_metadata.parquet")) |>
     dplyr::filter(file_id_cellNexus_single_cell %in% ids ) |>
-    cellNexus::get_single_cell_experiment(cache_directory = cache)
+    cellNexus::get_single_cell_experiment()
   
   # Basic structural checks
   expect_s4_class(sce, "SingleCellExperiment")
@@ -499,5 +497,5 @@ test_that("get_metadata and get_single_cell_experiment return expected SCE for t
   
 })
 
-# upload "/vast/scratch/users/shen.m/htan/hta_metadata.0.1.0.parquet" to Nectar cellNexus-metadata/hta_metadata.0.1.0.parquet
+# upload "/vast/scratch/users/shen.m/htan/hta_metadata.0.2.0.parquet" to Nectar cellNexus-metadata/hta_metadata.0.2.0.parquet
 

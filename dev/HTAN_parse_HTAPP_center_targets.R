@@ -25,7 +25,7 @@ tar_script({
     retrieval = "worker", 
     error = "continue",
     workspace_on_error = TRUE,
-    cue = tar_cue(mode = "never"),
+    cue = tar_cue(mode = "thorough"),
     controller = crew_controller_slurm(
       name = "elastic",
       workers = 300,
@@ -69,10 +69,33 @@ tar_script({
     
     colnames(sce_subset) <- paste0(sce_subset$barcode, "___", sample_id)
     
-    sce_subset
+    sce_subset |> 
+      convert_gene_to_ensemble()
+  }
+  
+  convert_gene_to_ensemble <- function(sce) {
+    # --- Convert SYMBOL to Ensembl ID
+    library(AnnotationFilter)
+    gene_id <- ensembldb::mapIds(
+      EnsDb.Hsapiens.v86::EnsDb.Hsapiens.v86,
+      keys       = rownames(sce), 
+      column     = "GENEID",      # output: Ensembl gene id
+      keytype    = "GENENAME",    # input: gene symbol
+      multiVals  = "first"        # choose first mapping when duplicates
+    )
+    
+    # drop unmapped
+    keep <- !is.na(gene_id)
+    sce <- sce[keep, ]
+    gene_id <- gene_id[keep]
+    rowData(sce)$gene_id <- gene_id
+    rownames(sce) <- gene_id
+    
+    sce
   }
   
   save_h5ad <- function(sample_id, sce, save_directory) {
+    if (!dir.exists(save_directory)) dir.create(save_directory, recursive = T)
     zellkonverter::writeH5AD(sce, file = paste0(save_directory, sample_id, ".h5ad"),
                              compression = "gzip")
     print(paste("saved successfully:", sample_id))
@@ -192,7 +215,7 @@ tar_script({
         save_h5ad(
           htapp_sce_tbl$sample_id, 
           htapp_sce_tbl$sce[[1]], 
-          "~/scratch/cache_temp/hta/09-11-2025/counts/"
+          "/vast/scratch/users/shen.m/htan/hta/09-11-2025/counts/"
         )
       },
       pattern = map(htapp_sce_tbl),

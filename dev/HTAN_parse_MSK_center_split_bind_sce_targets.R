@@ -84,11 +84,33 @@ tar_script({
     reducedDims(data) <- NULL
     metadata(data) <- list()
     
-    data
+    data |> 
+      convert_gene_to_ensemble()
   }
   
+  convert_gene_to_ensemble <- function(sce) {
+    # --- Convert SYMBOL to Ensembl ID
+    library(AnnotationFilter)
+    gene_id <- ensembldb::mapIds(
+      EnsDb.Hsapiens.v86::EnsDb.Hsapiens.v86,
+      keys       = rownames(sce), 
+      column     = "GENEID",      # output: Ensembl gene id
+      keytype    = "GENENAME",    # input: gene symbol
+      multiVals  = "first"        # choose first mapping when duplicates
+    )
+    
+    # drop unmapped
+    keep <- !is.na(gene_id)
+    sce <- sce[keep, ]
+    gene_id <- gene_id[keep]
+    rowData(sce)$gene_id <- gene_id
+    rownames(sce) <- gene_id
+    
+    sce
+  }
 
   save_h5ad <- function(sample_id, sce, save_directory) {
+    if (!dir.exists(save_directory)) dir.create(save_directory, recursive = T)
     .x = sce[[1]]
     zellkonverter::writeH5AD(.x, file = paste0(save_directory, sample_id, ".h5ad"),
                              compression = "gzip")
@@ -176,7 +198,7 @@ tar_script({
             sce_merged = map(
               sce_list,
               ~ {
-                browser()
+               # browser()
                 xs <- .x     # list of SCE objects
                 
                 # ---------------------------
