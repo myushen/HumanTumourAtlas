@@ -312,7 +312,7 @@ tar_script({
     # Save to disk
     tar_target(
       save_h5ad_to_disk,
-      save_h5ad(sample_sce_merged_tbl$sample_id, sample_sce_merged_tbl$sce_merged, "/vast/scratch/users/shen.m/htan/hta/09-11-2025/counts/"),
+      save_h5ad(sample_sce_merged_tbl$sample_id, sample_sce_merged_tbl$sce_merged, "/vast/scratch/users/shen.m/htan/hta_2025/0.1.0/counts/"),
       pattern = map(sample_sce_merged_tbl)
     )
   )
@@ -330,7 +330,7 @@ job::job({
   
 })
 
-tar_workspace(sce_merged_2ed158fc4d9d5a94, store = store, script = paste0(store, "_target_script.R") )
+tar_workspace(save_h5ad_to_disk_efab6f9963ff3050, store = store, script = paste0(store, "_target_script.R") )
 tar_meta(starts_with("sce_list_by_sample_list"), store = store) |> filter(is.na(error)) |> pull(name)
 sce_list_by_sample_list = tar_read(sce_list_by_sample_list, store = store) |> bind_rows()
 
@@ -339,7 +339,7 @@ sce_merged |> head() |> pull(sce_merged)
 
 # One anndata
 library(zellkonverter)
-anndata = readH5AD("/vast/scratch/users/shen.m/htan/hta/09-11-2025/counts/HTA8_1024_001101.h5ad",reader = "R", use_hdf5 = T)
+anndata = readH5AD("/vast/scratch/users/shen.m/htan/hta_2025/0.1.0/counts/HTA8_1024_001101.h5ad",reader = "R", use_hdf5 = T)
 anndata
 
 

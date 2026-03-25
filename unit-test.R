@@ -5,7 +5,7 @@ library(purrr)
 library(zellkonverter)
 library(tibble)
 library(stringr)
-x = get_metadata(cloud_metadata = get_metadata_url("hta_metadata.0.2.0.parquet"))
+x = get_metadata(cloud_metadata = get_metadata_url("hta_metadata.0.1.0.parquet"))
 
 # YOU WOULD EXPECT HTA ATLAS HERE: 
 x |> dplyr::count(atlas_id) 
@@ -15,6 +15,7 @@ sce = x |> filter(sample_id == "HTA3_8001_1001") |> get_single_cell_experiment(r
 sce
 
 # Test all samples
+debugonce(get_single_cell_experiment)
 sce = x |> get_single_cell_experiment(repository = NULL, cache_directory = "/vast/scratch/users/shen.m/htan/")
 sce
 

@@ -209,6 +209,8 @@ tar_script({
     # When used with pattern = map(), files is a single row (tibble/data.frame with 1 row)
     # Extract values as scalars and return the file path for format = "file"
     
+    if (!dir.exists(save_directory)) dir.create(save_directory, recursive = T)
+    
     output_file <- file.path(save_directory, paste0(files$sample_id[[1]], ".h5ad"))
     
     if (format == "csv") {
@@ -248,15 +250,17 @@ tar_script({
     tar_target(file_path, "/vast/scratch/users/shen.m/synapse_data/lung/counts/"),
     tar_target(
       csv_files,
-      read_metadata_file(metadata_path, file_path, format = "csv") 
+      read_metadata_file(metadata_path, file_path, format = "csv")
+      # |>
         # # FOR TESTING PURPOSE
         # head(2),
     ),
     tar_target(
       tsv_files,
-      read_metadata_file(metadata_path, file_path, format = "tsv") 
-        # # FOR TESTING PURPOSE
-        # head(2)
+      read_metadata_file(metadata_path, file_path, format = "tsv")
+      # # |>
+      #   # FOR TESTING PURPOSE
+      #   head(2)
     ),
     tar_target(
       saved_h5ad_from_csv,
@@ -286,7 +290,7 @@ job::job({
   
 })
 
-# tar_workspace(saved_h5ad_from_csv_7cea16f9edd8e615,store = store_file_hta_lung, script = paste0(store_file_hta_lung, "_target_script.R") )
+tar_workspace(saved_h5ad_from_csv_44bffd61caa5e4c0,store = store_file_hta_lung, script = paste0(store_file_hta_lung, "_target_script.R") )
 # tar_meta(store = store_file_hta_lung) |> dplyr::filter(!is.na(error)) |> distinct(name, error)
 # debugonce(save_h5ad_to_directory)
 # save_h5ad_to_directory(tsv_files, "/vast/scratch/users/shen.m/hta/09-11-2025/counts", "tsv" )

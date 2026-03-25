@@ -249,7 +249,7 @@ tar_script({
         save_h5ad(
           htapp_sce_tbl$sample_id, 
           htapp_sce_tbl$sce[[1]], 
-          "/vast/scratch/users/shen.m/htan/hta/09-11-2025/counts/"
+          "/vast/scratch/users/shen.m/htan/hta_2025/0.1.0/counts/"
         )
       },
       pattern = map(htapp_sce_tbl),
@@ -272,6 +272,6 @@ job::job({
 
 # One anndata
 library(zellkonverter)
-anndata = readH5AD("/vast/scratch/users/shen.m/htan/hta/09-11-2025/counts/HTA1_203_332101.h5ad",reader = "R", use_hdf5 = T)
+anndata = readH5AD("/vast/scratch/users/shen.m/htan/hta_2025/0.1.0/counts/HTA1_203_332101.h5ad",reader = "R", use_hdf5 = T)
 anndata
 

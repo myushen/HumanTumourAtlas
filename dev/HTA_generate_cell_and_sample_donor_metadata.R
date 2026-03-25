@@ -452,7 +452,7 @@ cell_sample_metadata <- cell_metadata |>
   mutate(self_reported_ethnicity = ifelse(is.na(self_reported_ethnicity), "unknown", self_reported_ethnicity),
          sex = ifelse(is.na(sex), "unknown", sex),
          assay = ifelse(is.na(assay), "scRNA-seq", assay)) |> # BETTER NOT HARDCODE HERE
-  mutate(atlas_id = "hta/09-11-2025") # For directory hierarchy
+  mutate(atlas_id = "hta_2025/0.1.0") # For directory hierarchy
 
 duckdb_write_parquet <- function(.tbl_sql, path, con) {
   sql_tbl <- dbplyr::sql_render(.tbl_sql)  # render SQL for con
@@ -466,7 +466,7 @@ duckdb_write_parquet <- function(.tbl_sql, path, con) {
 
 save <- duckdb_write_parquet(
   cell_sample_metadata,
-  path = "/vast/scratch/users/shen.m/htan/hta_metadata.0.2.0.parquet",
+  path = "/vast/scratch/users/shen.m/htan/hta_metadata.0.1.0.parquet",
   con = con
 )
 
@@ -487,7 +487,7 @@ test_that("get_metadata and get_single_cell_experiment return expected SCE for t
   
   cell_metadata <-  tbl(
     dbConnect(duckdb::duckdb(), dbdir = ":memory:"),
-    sql("SELECT * FROM read_parquet('/vast/scratch/users/shen.m/htan/hta_metadata.0.2.0.parquet')")
+    sql("SELECT * FROM read_parquet('/vast/scratch/users/shen.m/htan/hta_metadata.0.1.0.parquet')")
   )
   
   # Build test data
@@ -505,6 +505,7 @@ test_that("get_metadata and get_single_cell_experiment return expected SCE for t
   sce <- get_metadata(local_metadata = file.path(save_directory, "test_metadata.parquet")) |>
     dplyr::filter(file_id_cellNexus_single_cell %in% ids ) |>
     cellNexus::get_single_cell_experiment()
+      #repository = NULL, cache_directory = "/vast/scratch/users/shen.m/htan/")
   
   # Basic structural checks
   expect_s4_class(sce, "SingleCellExperiment")
@@ -518,5 +519,5 @@ test_that("get_metadata and get_single_cell_experiment return expected SCE for t
   
 })
 
-# upload "/vast/scratch/users/shen.m/htan/hta_metadata.0.2.0.parquet" to Nectar cellNexus-metadata/hta_metadata.0.2.0.parquet
+# upload "/vast/scratch/users/shen.m/htan/hta_metadata.0.1.0.parquet" to Nectar cellNexus-metadata/hta_metadata.0.1.0.parquet
 
