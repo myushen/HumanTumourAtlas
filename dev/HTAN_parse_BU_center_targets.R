@@ -44,7 +44,7 @@ tar_script({
   # Helper functions
   # ------------------------------------------------------------
   
-  parse_BU <- function(counts_path, biospecimen, filtered_cell_ids) {
+  parse_BU <- function(counts_path, biospecimen, cell_index_df) {
     # read counts
     raw_counts <- read.csv(counts_path, row.names = 1, check.names = FALSE) |> as.matrix()
     
@@ -56,14 +56,24 @@ tar_script({
     sce = SingleCellExperiment(assays = list(counts = raw_counts))
     sce$sample_id <- biospecimen
     
-    # Filter cells
-    sce_subset <- sce[, colnames(sce) %in% filtered_cell_ids]
+    cd <- colData(sce) |> 
+      as.data.frame() |> 
+      tibble::rownames_to_column(var = "old_cell_id")
     
-    # Update colnames with sample_id
-    colnames(sce_subset) <- paste0(colnames(sce_subset), "___", biospecimen)
+    # inner_join to filter
+    cd <- cd |> inner_join(cell_index_df, by = c("old_cell_id" = "NAME")) |> 
+      dplyr::rename(cell_id = cell_index)
     
-    sce_subset |> 
-      convert_gene_to_ensemble()
+    sce_subset = sce[, colnames(sce) %in% cell_index_df$NAME]
+    stopifnot(nrow(cd) == ncol(sce_subset))
+    
+    colnames(sce_subset) <- as.numeric(cd$cell_id)
+    
+    sce_subset <- if (all(grepl("^ENSG", rownames(sce_subset)))) {
+      sce_subset
+    } else {
+      sce_subset |> convert_gene_to_ensemble()
+    }
   }
   
   convert_gene_to_ensemble <- function(sce) {
@@ -121,20 +131,34 @@ tar_script({
     tar_target(
       bu_processed_df,
       {
+        set.seed(19980)
         file_metadata |> 
           filter(Atlas.Name=="HTAN BU") |>
           filter(Biospecimen |> str_detect(",")) |> 
           pull(full_path) |> 
-          map_dfr(~ read.csv(.x) |> dplyr::slice(-1))
+          map_dfr(~ read.csv(.x) |> dplyr::slice(-1)) |> 
+          
+        # Create cell Id index
+          group_by(SampleID) |>
+          mutate(cell_index = row_number()) |>
+          ungroup()
+        
+        
       },
       packages = c("dplyr", "purrr", "readr")
     ),
     
     # 3. Get filtered cell IDs
     tar_target(
-      bu_filtered_cell_ids,
+      cell_index_df,
       {
-        bu_processed_df |> pull(NAME)
+        bu_processed_df |> 
+          # This is ridicular to understand. For some reason, SampleID missed a digital from Biospecimen. 
+          # i.e, SampleID HTA3_8001_001, Biospecimen HTA3_8001_1001
+          mutate(
+            SampleID = sub("_(\\d+)$", "_1\\1", SampleID)
+          ) |>
+          select(NAME, cell_index, SampleID)
       }
     ),
     
@@ -171,7 +195,7 @@ tar_script({
         parse_BU(
           counts_path = row$full_path[1],
           biospecimen = row$sample_id[1],
-          filtered_cell_ids = bu_filtered_cell_ids
+          cell_index_df = cell_index_df
         )
       },
       pattern = map(bu_metadata_grouped),
@@ -223,5 +247,7 @@ job::job({
   
 })
 
-
-
+# One anndata
+library(zellkonverter)
+anndata = readH5AD("/vast/scratch/users/shen.m/htan/hta/09-11-2025/counts/HTA3_8001_1001.h5ad",reader = "R", use_hdf5 = T)
+anndata

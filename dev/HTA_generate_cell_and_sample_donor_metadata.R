@@ -98,7 +98,7 @@ tar_script({
     )
   )
   
-# Extract cell metadata from each h5ad file
+  # Extract cell metadata from each h5ad file
   get_h5ad_cell_metadata <- function(h5ad_file) {
     # Read h5ad file (only colData to be memory efficient)
     sce <- readH5AD(
@@ -149,9 +149,9 @@ tar_script({
     colData(sce) <- colData(sce)[ , wanted, drop = FALSE]
     
     sce <- sce |>       tidyr::separate(".cell",
-                                 c("sample", "barcode"),
-                                 sep = "_(?=[^_]+$)",
-                                 remove = FALSE) %>%
+                                        c("sample", "barcode"),
+                                        sep = "_(?=[^_]+$)",
+                                        remove = FALSE) %>%
       left_join(map_id, by = "sample") %>%
       dplyr::rename(sample_id = sample_HTAN_ID)
     
@@ -164,7 +164,7 @@ tar_script({
         file_id_cellNexus_single_cell = paste0(sample_id, ".h5ad")
       ) |> 
       dplyr::select(cell_id, sample_id, file_id_cellNexus_single_cell, contains("cell_type"))
-
+    
     
     col_data
     
@@ -175,7 +175,7 @@ tar_script({
       h5ad_files,
       # Get all saved h5ad files
       list.files("/vast/scratch/users/shen.m/htan/hta/09-11-2025/counts/", pattern = "\\.h5ad$", full.names = TRUE)
-      ),
+    ),
     
     tar_target(
       synapse_h5ad,
@@ -210,7 +210,9 @@ job::job({
 # debugonce(get_synapse_h5ad_cell_type)
 # get_synapse_h5ad_cell_type(synapse_h5ad )
 
-cell_metadata <- tar_read(cell_data_list,  store = store_file_hta_cell_metadata) |> bind_rows()
+cell_metadata <- tar_read(cell_data_list,  store = store_file_hta_cell_metadata) |>
+  bind_rows() |> 
+  mutate(cell_id = cell_id |> as.numeric())
 
 # Collapse dataframe because cell type data is all over the place
 synapse_h5ad_cell_type_df <- tar_read(synapse_h5ad_cell_type_df, store = store_file_hta_cell_metadata ) |> bind_rows() |> 
@@ -234,9 +236,25 @@ synapse_h5ad_cell_type_df <- tar_read(synapse_h5ad_cell_type_df, store = store_f
     bind_rows(unique_cell, duplicated_cell)
   }
 
-cell_metadata <- cell_metadata |> left_join(synapse_h5ad_cell_type_df |> 
+# cell id map
+bu_cell_index_df = tar_read(cell_index_df, store = "~/scratch/htan/BU_target_store") |> 
+  dplyr::rename(.cell = NAME,
+                sample_id = SampleID)
+htapp_cell_index_df = tar_read(htapp_cell_index_df, store ="~/scratch/htan/HTAPP_target_store") |>
+  dplyr::rename(.cell = NAME) |> as_tibble()
+msk_cell_index_df = tar_read(msk_cell_index_df, store = "~/scratch/htan/MSK_target_store") |> 
+  select(.cell, sample_id, cell_index)
+
+map <- bind_rows(bu_cell_index_df, htapp_cell_index_df, msk_cell_index_df)
+map <- map |>  mutate(cell_index = cell_index |> as.numeric())
+
+cell_metadata <- cell_metadata |> left_join(map, by = c("cell_id" = "cell_index", "sample_id"))
+
+
+cell_metadata <- cell_metadata |> left_join(synapse_h5ad_cell_type_df |>
                                               filter(!is.na(sample_id)),
-                                            by = c("cell_id", "sample_id", "file_id_cellNexus_single_cell"))
+                                            by = c(".cell" = "cell_id", "sample_id", "file_id_cellNexus_single_cell")) |> 
+  select(-.cell)
 
 
 # Save cell metadata
@@ -258,7 +276,7 @@ cell_metadata <-  tbl(
 # Create Sample, Donor metadata
 # =============================================================================
 file_metadata <- read.csv("/home/users/allstaff/shen.m/projects/HTAN/files_metadata_2025_10_21.tsv",
-           sep = "\t", na.strings = c("NA",""), header = TRUE) |> as_tibble() |> 
+                          sep = "\t", na.strings = c("NA",""), header = TRUE) |> as_tibble() |> 
   # THIS IS ASSIGNED WRONG TO BIOSPECIMEN. HTAN PHASE1 IS SOOOO COMPLEX!
   filter(Filename != "single_cell_RNAseq_level_4_lung/lung_HTA1_203_332102_ch1_L4.tsv") |>
   
@@ -310,14 +328,18 @@ sample_metadata <-  read.csv(
   sep = "\t",
   na.strings = c("NA", ""),
   header = TRUE
-)
- 
+) |> 
+  # Drop columns where all values are NA
+  select(where(~ !all(is.na(.))))
+
 donors_metadata <- read.csv(
   "/home/users/allstaff/shen.m/projects/HTAN/donors_metadata_2025_10_21.tsv",
   sep = "\t",
   na.strings = c("NA", ""),
   header = TRUE
-)
+) |> 
+  # Drop columns where all values are NA
+  select(where(~ !all(is.na(.))))
 
 
 # Joining -----------------------------------------------------------------
@@ -330,13 +352,12 @@ sample_metadata <- file_metadata |> left_join(
 sample_metadata <- sample_metadata |> 
   left_join(
     donors_metadata, 
-    by = c("Participant.ID" = "HTAN.Participant.ID", "Atlas.Name", "Publications",
+    by = c("Participant.ID" = "HTAN.Participant.ID", "Atlas.Name",
            "Atlas.ID", "Level")
   ) |> 
   dplyr::rename(
     donor_id = Participant.ID,
     diagnosis_age = Age.at.Diagnosis..years.,
-    title = Publications,
     center = Atlas.Name,
     center_id = Atlas.ID,
     sex = Gender,
@@ -352,7 +373,7 @@ sample_metadata <- sample_metadata |>
          tissue = tolower(tissue),
          sex = ifelse(is.na(sex), "unknown", sex),
          assay = ifelse(is.na(assay), "scRNA-seq", assay) # BETTER NOT HARDCODE HERE
-         ) |> 
+  ) |> 
   
   select(-Synapse.ID.x, -Synapse.ID.y)
 

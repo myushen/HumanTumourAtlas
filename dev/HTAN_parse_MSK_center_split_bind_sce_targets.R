@@ -26,7 +26,7 @@ tar_script({
     retrieval = "worker", 
     error = "continue",
     workspace_on_error = TRUE,
-    cue = tar_cue(mode = "never"),
+    cue = tar_cue(mode = "thorough"),
     controller = crew_controller_slurm(
       name = "elastic",
       workers = 300,
@@ -34,7 +34,7 @@ tar_script({
       seconds_idle = 30,
       crashes_error = 10,
       options_cluster = crew_options_slurm(
-        memory_gigabytes_required = c(30, 40, 60, 100, 150), 
+        memory_gigabytes_required = c(40, 60, 80), 
         cpus_per_task = c(2),
         time_minutes = c(60*24),
         verbose = T
@@ -45,7 +45,7 @@ tar_script({
   # ------------------------------------------------------------
   # process one file
   # ------------------------------------------------------------
-  process_one_file <- function(fp, sample_id) {
+  process_one_file <- function(fp, sample_id, cell_index_df) {
     
     map_id <- read.csv("/vast/scratch/users/shen.m/synapse_data/lung/counts/adata_sample_id_htan_id_map.csv")
     
@@ -75,6 +75,18 @@ tar_script({
     if (length(keep) == 0) return(NULL)
     data <- data[, keep]
     
+    # ---- Apply precomputed global index map ----
+    cd <- colData(data) |>
+      as.data.frame() |>
+      tibble::rownames_to_column(var = "old_cell_id") |>
+      dplyr::inner_join(cell_index_df, by = c("sample_id", "old_cell_id" = ".cell"))
+    
+    if (nrow(cd) == 0) return(NULL)
+    
+    data <- data[, cd$old_cell_id]
+    stopifnot(nrow(cd) == ncol(data))
+    colnames(data) <- as.character(cd$cell_index)
+    
     # keep first assay only
     assay_name <- names(assays(data))[1]
     assays(data) <- assays(data)[assay_name]
@@ -84,8 +96,11 @@ tar_script({
     reducedDims(data) <- NULL
     metadata(data) <- list()
     
-    data |> 
-      convert_gene_to_ensemble()
+    data <- if (all(grepl("^ENSG", rownames(data)))) {
+      data
+    } else {
+      data |> convert_gene_to_ensemble()
+    }
   }
   
   convert_gene_to_ensemble <- function(sce) {
@@ -108,7 +123,7 @@ tar_script({
     
     sce
   }
-
+  
   save_h5ad <- function(sample_id, sce, save_directory) {
     if (!dir.exists(save_directory)) dir.create(save_directory, recursive = T)
     .x = sce[[1]]
@@ -148,6 +163,41 @@ tar_script({
       }
     ),
     
+    # 2. Global retrievable map of numeric cell indices
+    tar_target(
+      msk_cell_index_df,
+      {
+        map_id <- read.csv("/vast/scratch/users/shen.m/synapse_data/lung/counts/adata_sample_id_htan_id_map.csv")
+        h5ad_files <- list.files(
+          "/vast/scratch/users/shen.m/synapse_data/lung/counts/",
+          pattern = ".h5ad",
+          full.name = TRUE
+        )
+        
+        purrr::map_dfr(
+          h5ad_files,
+          ~{
+            data <- zellkonverter::readH5AD(.x, reader = "R", use_hdf5 = TRUE)
+            colData(data) |>
+              as.data.frame() |>
+              tibble::rownames_to_column(".cell") |>
+              tidyr::separate(".cell", c("sample", "barcode"), sep = "_(?=[^_]+$)", remove = FALSE) |>
+              dplyr::left_join(map_id, by = "sample", copy = TRUE) |>
+              dplyr::rename(sample_id = sample_HTAN_ID) |>
+              dplyr::filter(!is.na(sample_id)) |>
+              tidyr::separate_rows(sample_id, sep = ";") |>
+              dplyr::mutate(full_path = .x)
+          },
+          .progress = TRUE
+        ) |>
+          dplyr::group_by(sample_id) |>
+          dplyr::mutate(cell_index = dplyr::row_number()) |>
+          dplyr::ungroup() |>
+          dplyr::select(sample_id, full_path, .cell, cell_index)
+      },
+      packages = c("dplyr", "purrr", "tidyr", "zellkonverter", "tibble", "SummarizedExperiment")
+    ),
+    
     tar_target(
       metadata_group_by_sample_id,
       h5ad_metadata     |>
@@ -156,10 +206,19 @@ tar_script({
       iteration = "group"
     ),
     
-    # 4. Process all files for this sample
+    # 3. Process all files for this sample
     tar_target(
       sce_list_per_sample,
-      process_one_file(metadata_group_by_sample_id$full_path, metadata_group_by_sample_id$sample_id),
+      process_one_file(
+        metadata_group_by_sample_id$full_path,
+        metadata_group_by_sample_id$sample_id,
+        msk_cell_index_df |>
+          dplyr::filter(
+            sample_id == metadata_group_by_sample_id$sample_id,
+            full_path == metadata_group_by_sample_id$full_path
+          ) |>
+          dplyr::select(sample_id, .cell, cell_index)
+      ),
       pattern = map(metadata_group_by_sample_id),
       iteration = "list"
     ),
@@ -198,7 +257,7 @@ tar_script({
             sce_merged = map(
               sce_list,
               ~ {
-               # browser()
+                # browser()
                 xs <- .x     # list of SCE objects
                 
                 # ---------------------------
@@ -235,7 +294,7 @@ tar_script({
                     colData = cd,
                     rowData = S4Vectors::DataFrame(row.names = common_genes)
                   )
-           
+                  
                 })
                 
                 # ---------------------------
@@ -278,6 +337,10 @@ sce_list_by_sample_list = tar_read(sce_list_by_sample_list, store = store) |> bi
 sce_merged = tar_read(sce_merged, store = store) |> bind_rows()
 sce_merged |> head() |> pull(sce_merged)
 
+# One anndata
+library(zellkonverter)
+anndata = readH5AD("/vast/scratch/users/shen.m/htan/hta/09-11-2025/counts/HTA8_1024_001101.h5ad",reader = "R", use_hdf5 = T)
+anndata
 
 
 

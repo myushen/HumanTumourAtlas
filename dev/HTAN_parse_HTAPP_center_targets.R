@@ -45,7 +45,7 @@ tar_script({
   # Helper functions
   # ------------------------------------------------------------
   
-  parse_HTAPP <- function(sample_id, mtx_path, genes_path, barcodes_path, processed_path) {
+  parse_HTAPP <- function(sample_id, mtx_path, genes_path, barcodes_path, cell_index_df) {
     counts <- ReadMtx(mtx = mtx_path, 
                       cells = barcodes_path, 
                       features = genes_path, 
@@ -54,10 +54,6 @@ tar_script({
     
     genes <- read.delim(genes_path, header = FALSE)$V1 # Extract Ensemble ID 
     barcodes <- read.delim(barcodes_path, header = FALSE)$V1 
-    filtered_df <- read.table(processed_path, sep = "\t", header = TRUE, stringsAsFactors = FALSE)[-1,]
-    filtered_cell_id <- filtered_df |> pull(NAME)
-    
-    
     sce <- SingleCellExperiment(
       assays = list(counts = counts),
       rowData = data.frame(gene_id = genes) |> tibble::column_to_rownames("gene_id"),
@@ -65,12 +61,24 @@ tar_script({
                            sample_id = sample_id)
     )
     
-    sce_subset <- sce[, colnames(sce) %in% filtered_cell_id]
+    cd <- colData(sce) |> 
+      as.data.frame() |> 
+      tibble::rownames_to_column(var = "old_cell_id")
     
-    colnames(sce_subset) <- paste0(sce_subset$barcode, "___", sample_id)
+    cd <- cd |> inner_join(cell_index_df, by = c("old_cell_id" = "NAME")) |> 
+      dplyr::rename(cell_id = cell_index)
     
-    sce_subset |> 
-      convert_gene_to_ensemble()
+    sce_subset = sce[, colnames(sce) %in% cell_index_df$NAME]
+    stopifnot(nrow(cd) == ncol(sce_subset))
+    
+    colnames(sce_subset) <- as.numeric(cd$cell_id)
+    
+    sce_subset <- if (all(grepl("^ENSG", rownames(sce_subset)))) {
+      sce_subset
+    } else {
+      sce_subset |> convert_gene_to_ensemble()
+    }
+    sce_subset
   }
   
   convert_gene_to_ensemble <- function(sce) {
@@ -164,7 +172,31 @@ tar_script({
       packages = c("dplyr", "tidyr", "stringr", "purrr")
     ),
     
-    # 3. Group by sample_id for parallel processing
+    # 3. Build global NAME -> cell_index map keyed by sample_id
+    tar_target(
+      htapp_cell_index_df,
+      {
+        htapp_metadata |>
+          dplyr::select(sample_id, processed_file) |>
+          dplyr::distinct() |>
+          purrr::pmap_dfr(function(sample_id, processed_file) {
+            read.table(
+              processed_file,
+              sep = "\t",
+              header = TRUE,
+              stringsAsFactors = FALSE
+            )[-1, ] |>
+              dplyr::mutate(
+                sample_id = sample_id,
+                cell_index = dplyr::row_number()
+              ) |>
+              dplyr::select(sample_id, NAME, cell_index)
+          })
+      },
+      packages = c("dplyr", "purrr")
+    ),
+    
+    # 4. Group by sample_id for parallel processing
     tar_target(
       htapp_metadata_grouped,
       htapp_metadata |>
@@ -173,18 +205,20 @@ tar_script({
       iteration = "group"
     ),
     
-    # 4. Process each sample in parallel
+    # 5. Process each sample in parallel
     tar_target(
       htapp_sce_per_sample,
       {
         row <- htapp_metadata_grouped
-        # After pivot_wider, each row should have all file paths
+        sample_cell_index_df <- htapp_cell_index_df |>
+          dplyr::filter(sample_id == row$sample_id[1]) |>
+          dplyr::select(NAME, cell_index)
         parse_HTAPP(
           sample_id = row$sample_id[1],
           mtx_path = row$mtx_path[1],
           genes_path = row$genes_path[1],
           barcodes_path = row$barcodes_path[1],
-          processed_path = row$processed_file[1]
+          cell_index_df = sample_cell_index_df
         )
       },
       pattern = map(htapp_metadata_grouped),
@@ -192,7 +226,7 @@ tar_script({
       packages = c("SingleCellExperiment", "Seurat", "dplyr", "tibble")
     ),
     
-    # 5. Create tibble with sample_id and sce
+    # 6. Create tibble with sample_id and sce
     tar_target(
       htapp_sce_tbl,
       {
@@ -207,7 +241,7 @@ tar_script({
       iteration = "list"
     ),
     
-    # 6. Save to disk
+    # 7. Save to disk
     tar_target(
       save_htapp_h5ad,
       {
@@ -236,8 +270,8 @@ job::job({
   
 })
 
-tar_workspace(save_htapp_h5ad_b9d77b97beed2a7a, store = store, script = paste0(store, "_target_script.R") )
-tar_meta(starts_with("sce_list_by_sample_list"), store = store) |> filter(is.na(error)) |> pull(name)
-sce_list_by_sample_list = tar_read(sce_list_by_sample_list, store = store) |> bind_rows()
-
+# One anndata
+library(zellkonverter)
+anndata = readH5AD("/vast/scratch/users/shen.m/htan/hta/09-11-2025/counts/HTA1_203_332101.h5ad",reader = "R", use_hdf5 = T)
+anndata
 
