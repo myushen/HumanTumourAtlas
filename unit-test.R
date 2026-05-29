@@ -15,7 +15,6 @@ sce = x |> filter(sample_id == "HTA3_8001_1001") |> get_single_cell_experiment(r
 sce
 
 # Test all samples
-debugonce(get_single_cell_experiment)
 sce = x |> get_single_cell_experiment(repository = NULL, cache_directory = "/vast/scratch/users/shen.m/htan/")
 sce
 
