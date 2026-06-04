@@ -15,7 +15,8 @@
 #    - Creates key columns:
 #      * cell_id: Unique cell identifier (format: barcode___Biospecimen)
 #      * sample_id: Biospecimen identifier (or Biospecimen___channel for multi-channel)
-#      * file_id_cellNexus_single_cell: File identifier for cellNexus integration
+#      * file_id_cellNexus_single_cell: File identifier for cellNexus single cell integration
+#      * file_id_cellNexus_pseudobulk: File identifier for cellNexus pseudobulk integration
 #    - Handles duplicate cells by collapsing cell type annotations
 #    - Memory efficient: Only reads colData from h5ad files, not expression data
 #
@@ -48,6 +49,7 @@
 library(targets)
 library(dplyr)
 library(duckdb)
+library(stringr)
 # =============================================================================
 # Create cell-level metadata
 # =============================================================================
@@ -142,9 +144,12 @@ tar_script({
       as_tibble() |> 
       mutate(
         # THERE SHOULD BE ANOTHE COLUMN IN THE METADATA TO SPECIFIY HTA DATA
-        file_id_cellNexus_single_cell = paste0(sample_id, ".h5ad")
+        file_id_cellNexus_single_cell = paste0(sample_id, ".h5ad"),
+        
+        # Temporary: pseudobulk and single cell share the same file id
+        file_id_cellNexus_pseudobulk = file_id_cellNexus_single_cell
       ) |>
-      dplyr::select(cell_id, sample_id, file_id_cellNexus_single_cell, contains("cell_type"))
+      dplyr::select(cell_id, sample_id, file_id_cellNexus_single_cell, file_id_cellNexus_pseudobulk, contains("cell_type"))
     
     col_data
   }
@@ -185,9 +190,11 @@ tar_script({
       as_tibble() |> 
       mutate(
         # THERE SHOULD BE ANOTHE COLUMN IN THE METADATA TO SPECIFIY HTA DATA
-        file_id_cellNexus_single_cell = paste0(sample_id, ".h5ad")
+        file_id_cellNexus_single_cell = paste0(sample_id, ".h5ad"),
+        # Temporary: pseudobulk and single cell share the same file id
+        file_id_cellNexus_pseudobulk = file_id_cellNexus_single_cell
       ) |> 
-      dplyr::select(cell_id, sample_id, file_id_cellNexus_single_cell, contains("cell_type"))
+      dplyr::select(cell_id, sample_id, file_id_cellNexus_single_cell, file_id_cellNexus_pseudobulk, contains("cell_type"))
     
     
     col_data
@@ -198,7 +205,7 @@ tar_script({
     tar_target(
       h5ad_files,
       # Get all saved h5ad files
-      list.files("/vast/scratch/users/shen.m/htan/hta/09-11-2025/counts/", pattern = "\\.h5ad$", full.names = TRUE)
+      list.files("/vast/scratch/users/shen.m/htan/hta_2025/0.1.0/counts/", pattern = "\\.h5ad$", full.names = TRUE)
     ),
     
     tar_target(
@@ -251,7 +258,7 @@ synapse_h5ad_cell_type_df <- tar_read(synapse_h5ad_cell_type_df, store = store_f
     # ---- DUPLICATED: collapse only these ----
     duplicated_cell <- df |> 
       filter(cell_count > 1) |>
-      group_by(cell_id, sample_id, file_id_cellNexus_single_cell) |>
+      group_by(cell_id, sample_id, file_id_cellNexus_single_cell, file_id_cellNexus_pseudobulk) |>
       summarize(
         across(everything(), ~ dplyr::first(na.omit(.x))),
         .groups = "drop"
@@ -277,8 +284,24 @@ cell_metadata <- cell_metadata |> left_join(map, by = c("cell_id" = "cell_index"
 
 cell_metadata <- cell_metadata |> left_join(synapse_h5ad_cell_type_df |>
                                               filter(!is.na(sample_id)),
-                                            by = c(".cell" = "cell_id", "sample_id", "file_id_cellNexus_single_cell")) |> 
-  select(-.cell)
+                                            by = c(".cell" = "cell_id", "sample_id", "file_id_cellNexus_single_cell", "file_id_cellNexus_pseudobulk")) |> 
+  select(-.cell) |>
+  
+  # (Temporary): Use cell_type_cluster if exists, otherwise use cell_type_fine, otherwise cell_type_coarse_final 
+  # Create a quarto report to visualise discordant then revise the decisions.
+  mutate(
+    cell_type = case_when(
+      !is.na(cell_type_cluster)    ~ cell_type_cluster,
+      !is.na(cell_type_fine)       ~ cell_type_fine,
+      !is.na(cell_type_coarse_final) ~ cell_type_coarse_final
+    )
+  ) |>
+  select(-c(
+    cell_type_fine, cell_type_general, cell_type_med,
+    cell_type_broad, cell_type_final, cell_type_coarse_final,
+    cell_type_medium_final, cell_type_cluster, cell_type_coarse,
+    cell_count
+  ))
 
 
 # Save cell metadata
@@ -299,6 +322,7 @@ cell_metadata <-  tbl(
 # =============================================================================
 # Create Sample, Donor metadata
 # =============================================================================
+file_path = "/vast/scratch/users/shen.m/synapse_data/lung/counts/"
 file_metadata <- read.csv("/home/users/allstaff/shen.m/projects/HTAN/files_metadata_2025_10_21.tsv",
                           sep = "\t", na.strings = c("NA",""), header = TRUE) |> as_tibble() |> 
   # THIS IS ASSIGNED WRONG TO BIOSPECIMEN. HTAN PHASE1 IS SOOOO COMPLEX!
@@ -342,7 +366,8 @@ file_metadata <- read.csv("/home/users/allstaff/shen.m/projects/HTAN/files_metad
   ungroup() |>
   distinct(sample_id, Biospecimen, Assay, Organ, Atlas.Name, Atlasid) |> 
   mutate(
-    file_id_cellNexus_single_cell = paste0(sample_id, ".h5ad")
+    file_id_cellNexus_single_cell = paste0(sample_id, ".h5ad"),
+    file_id_cellNexus_pseudobulk = file_id_cellNexus_single_cell
   ) |> 
   as_tibble()
 
@@ -472,7 +497,7 @@ sample_metadata <- tbl(
 )
 
 cell_sample_metadata <- cell_metadata |> 
-  left_join(sample_metadata, by = c("sample_id", "file_id_cellNexus_single_cell"), copy = TRUE) |> 
+  left_join(sample_metadata, by = c("sample_id", "file_id_cellNexus_single_cell", "file_id_cellNexus_pseudobulk"), copy = TRUE) |> 
   mutate(self_reported_ethnicity = ifelse(is.na(self_reported_ethnicity), "unknown", self_reported_ethnicity),
          sex = ifelse(is.na(sex), "unknown", sex),
          assay = ifelse(is.na(assay), "scRNA-seq", assay)) |> # BETTER NOT HARDCODE HERE
@@ -503,6 +528,7 @@ library(cellNexus)
 library(dplyr)
 library(testthat)
 library(duckdb)
+library(tidySingleCellExperiment)
 test_that("get_metadata and get_single_cell_experiment return expected SCE for test sample", {
   
   save_directory <- tempdir()   # or your defined directory
