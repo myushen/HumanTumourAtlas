@@ -349,12 +349,12 @@ plot_pseudobulk_boxplot = function(pb, top_n = 20, cell_type_col) {
     )
   
   # Plot
-  ggplot(plot_df, aes(x = cell_type, y = logcounts, fill = cell_type)) +
+  ggplot(plot_df, aes(x = cell_type, y = logcounts)) +
     geom_boxplot(outlier.size = 0.5, alpha = 0.8) +
     facet_wrap(~ gene, scales = "free_y") +
-    scale_fill_manual(
-      values = colorRampPalette(RColorBrewer::brewer.pal(8, "Set2"))(n_distinct(plot_df$cell_type))
-    ) +
+    # scale_fill_manual(
+    #   values = colorRampPalette(RColorBrewer::brewer.pal(8, "Set2"))(n_distinct(plot_df$cell_type))
+    # ) +
     labs(
       x = "Cell type", y = "logcounts",
       title = glue::glue("Top {top_n} variable genes across cell types")
