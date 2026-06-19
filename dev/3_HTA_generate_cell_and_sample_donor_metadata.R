@@ -258,7 +258,7 @@ synapse_h5ad_cell_type_df <- tar_read(synapse_h5ad_cell_type_df, store = store_f
     # ---- DUPLICATED: collapse only these ----
     duplicated_cell <- df |> 
       filter(cell_count > 1) |>
-      group_by(cell_id, sample_id, file_id_cellNexus_single_cell, file_id_cellNexus_pseudobulk) |>
+      group_by(cell_id, sample_id, file_id_cellNexus_single_cell) |>
       summarize(
         across(everything(), ~ dplyr::first(na.omit(.x))),
         .groups = "drop"

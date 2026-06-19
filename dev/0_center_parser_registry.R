@@ -216,7 +216,7 @@ parse_BU <- function(counts_path, biospecimen, cell_index_df) {
 #' Build cell index from BU L4 CSV files.
 #' Fixes the known SampleID digit-drop bug (HTA3_8001_001 -> HTA3_8001_1001).
 build_bu_cell_index <- function(l4_csv_paths) {
-  purrr::map_dfr(l4_csv_paths, ~ read.csv(.x) |> slice(-1)) |>
+  purrr::map_dfr(l4_csv_paths, ~ read.csv(.x, colClasses = "character") |> slice(-1)) |>
     mutate(SampleID = sub("_(\\d+)$", "_1\\1", SampleID)) |>
     group_by(SampleID) |>
     mutate(cell_index = row_number()) |>
