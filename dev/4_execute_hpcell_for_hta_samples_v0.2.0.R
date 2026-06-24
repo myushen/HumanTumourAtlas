@@ -9,19 +9,20 @@ library(targets)
 library(crew)
 library(crew.cluster)
 library(duckdb)
+library(SummarizedExperiment)
 
 cell_metadata <-  tbl(
   dbConnect(duckdb::duckdb(), dbdir = ":memory:"),
-  sql("SELECT * FROM read_parquet('/vast/scratch/users/shen.m/htan/hta_metadata.0.1.0.parquet')")
+  sql("SELECT * FROM read_parquet('/vast/scratch/users/shen.m/htan/hta_metadata.0.2.0.parquet')")
 )
 sce = cell_metadata |>
-  dplyr::filter(sample_id == "HTA8_3004_1"  ) |>
-  cellNexus::get_single_cell_experiment()
+  dplyr::filter(sample_id == "HTA1_203_332102"  ) |>
+  cellNexus::get_single_cell_experiment(cache_directory = "/vast/scratch/users/shen.m/htan/")
 
 sce |> counts() |> as.matrix() |>  hist(ylim=c(0,1e3), breaks = 50)
 
-
-summary_store = "/vast/scratch/users/shen.m/hta_pilot_lung_check_counts_distribution_summary_target_store"
+breast_cell_metadata <- cell_metadata |> filter(is.na(tissue) | str_detect(tissue, "breast|Breast"))
+summary_store = "/vast/scratch/users/shen.m/hta_breast_check_counts_distribution_summary_target_store"
 tar_script({
   library(dplyr)
   library(SummarizedExperiment)
@@ -111,11 +112,11 @@ tar_script({
   # Stage 2 – pure computation on the pre-loaded matrix; no I/O.
   calc_counts_metrics <- function(sce_data) {
     if (is.null(sce_data)) return(NULL)
-  
+    
     # Subsample cells to 1e4 if dataset is large
-    if (ncol(sce_data$counts_mat) > 1e4) {
+    if (ncol(sce_data$counts_mat) > 5e3) {
       set.seed(42)
-      sampled_cols <- sample(ncol(sce_data$counts_mat), 1e4)
+      sampled_cols <- sample(ncol(sce_data$counts_mat), 5e3)
       sce_data$counts_mat <- sce_data$counts_mat[, sampled_cols]
     }
     
@@ -155,7 +156,7 @@ tar_script({
     tar_target(
       files,
       list.files(
-        "/vast/scratch/users/shen.m/htan/hta_2025/0.1.0/counts/",
+        "/vast/scratch/users/shen.m/htan/hta_2025/0.2.0/counts/",
         full.names = TRUE, pattern = "\\.h5ad$"
       ),
       deployment = "main"
@@ -168,7 +169,7 @@ tar_script({
       pattern   = map(files),
       iteration = "list",
       resources = tar_resources(
-        crew = tar_resources_crew(controller = "elastic_5_minimal")
+        crew = tar_resources_crew(controller = "elastic_10")
       )
     ),
     
@@ -196,9 +197,15 @@ job::job({
   
 })
 
+# tar_workspace(sample_summary_df_e8c275e236b86872,script = glue("{summary_store}/_targets.R"),
+#               store = glue("{summary_store}/_targets"))
+# debugonce(calc_counts_metrics)
+# calc_counts_metrics(sce_counts)
+
 sample_summary_df = tar_read(sample_summary_df, store = glue("{summary_store}/_targets")) |>
-  bind_rows() |>  mutate(max_gt_20 = ifelse(max_val > 20, TRUE, FALSE)) |>
-  mutate(sample_id = stringr::str_remove(sample_id, ".h5ad"))
+  bind_rows() |>  mutate(max_gt_20 = ifelse(max_val > 20, TRUE, FALSE)) 
+# |>
+#   mutate(sample_id = stringr::str_remove(sample_id, ".h5ad"))
 
 impute_x_approximate_distribution <- function(df,
                                               counts_gap_threshold,
@@ -231,6 +238,9 @@ impute_x_approximate_distribution <- function(df,
         # 5) Has negatives and large values
         has_negative & max_gt_20 & !all_integer & !has_floating ~ "raw_limit_max_to_10",
         
+        # 6) No negatives, and all integers
+        !has_negative & all_integer ~  "raw_limit_max_to_10",
+         
         # fallback
         TRUE ~ NA_character_
       )
@@ -257,13 +267,13 @@ sample_summary_df = sample_summary_df |> impute_x_approximate_distribution(0.25,
 
 
 sample_summary_df <- sample_summary_df |>
-  mutate(file_name = file.path("/vast/scratch/users/shen.m/htan/hta_2025/0.1.0/counts/", 
+  mutate(file_name = file.path("/vast/scratch/users/shen.m/htan/hta_2025/0.2.0/counts/", 
                                sample_id),
          feature_thresh = if_else(n_genes > 1e3, 200, floor(500/2e4)*n_genes)) |>
   select(file_name, sample_id, method_to_apply, count_upper_bound, feature_thresh)
 
-sample_summary_df |> arrow::write_parquet("/vast/projects/cellxgene_curated/hta/sample_summary_df_for_hpcell.parquet", compression = "gzip")
-sample_summary_df <- arrow::read_parquet("/vast/projects/cellxgene_curated/hta/sample_summary_df_for_hpcell.parquet")
+sample_summary_df |> arrow::write_parquet("/vast/projects/cellxgene_curated/hta/breast_sample_summary_df_for_hpcell.parquet", compression = "gzip")
+sample_summary_df <- arrow::read_parquet("/vast/projects/cellxgene_curated/hta/breast_sample_summary_df_for_hpcell.parquet")
 
 sample_names <-
   sample_summary_df |> 
@@ -274,7 +284,7 @@ functions = sample_summary_df |> pull(method_to_apply)
 feature_thresh = sample_summary_df |> pull(feature_thresh)
 count_upper_bound = sample_summary_df |> pull(count_upper_bound)
 
-my_store = "/vast/scratch/users/shen.m/hta_lung_run_hpcell_target_store"
+my_store = "/vast/scratch/users/shen.m/hta_breast_run_hpcell_target_store"
 
 new_elastic <- function(name, mem_gb, time_min, workers, crashes_max, cpus_per_task = 1, backup = NULL) {
   crew_controller_slurm(
@@ -473,7 +483,7 @@ tar_script({
   list(
     
     # The input DO NOT DELETE
-    tar_target(my_store, "/vast/scratch/users/shen.m/hta_lung_run_hpcell_target_store", deployment = "main"),
+    tar_target(my_store, "/vast/scratch/users/shen.m/hta_breast_run_hpcell_target_store", deployment = "main"),
     
     tar_target(
       target_name,
@@ -497,13 +507,13 @@ tar_script({
   )
   
   
-}, script = "/vast/scratch/users/shen.m/hta_lung_lighten_annotation_tbl_target.R", ask = FALSE)
+}, script = "/vast/scratch/users/shen.m/hta_breast_lighten_annotation_tbl_target.R", ask = FALSE)
 
 job::job({
   
   tar_make(
-    script = "/vast/scratch/users/shen.m/hta_lung_lighten_annotation_tbl_target.R",
-    store = "/vast/scratch/users/shen.m/hta_lung_lighten_annotation_tbl_target", 
+    script = "/vast/scratch/users/shen.m/hta_breast_lighten_annotation_tbl_target.R",
+    store = "/vast/scratch/users/shen.m/hta_breast_lighten_annotation_tbl_target", 
     reporter = "summary"
   )
   
@@ -519,11 +529,11 @@ library(targets)
 cell_metadata <- 
   tbl(
     dbConnect(duckdb::duckdb(), dbdir = ":memory:"),
-    sql("SELECT * FROM read_parquet('/vast/scratch/users/shen.m/htan/hta_metadata.0.1.0.parquet')")
+    sql("SELECT * FROM read_parquet('/vast/scratch/users/shen.m/htan/hta_metadata.0.2.0.parquet')")
   )
 
 cell_annotation = 
-  tar_read(annotation_tbl_light, store = "/vast/scratch/users/shen.m/hta_lung_lighten_annotation_tbl_target") |> 
+  tar_read(annotation_tbl_light, store = "/vast/scratch/users/shen.m/hta_breast_lighten_annotation_tbl_target") |> 
   dplyr::rename(
     blueprint_first_labels_fine = blueprint_first.labels.fine, 
     monaco_first_labels_fine = monaco_first.labels.fine, 
@@ -541,23 +551,23 @@ cell_annotation = cell_annotation |> mutate(
 #                                         compression = "zstd")
 
 empty_droplet = 
-  tar_read(empty_tbl, store = "/vast/scratch/users/shen.m/hta_lung_run_hpcell_target_store") |>
+  tar_read(empty_tbl, store = "/vast/scratch/users/shen.m/hta_breast_run_hpcell_target_store") |>
   bind_rows() |>
   dplyr::rename(cell_ = .cell)
 
 alive_cells = 
-  tar_read(alive_tbl, store = "/vast/scratch/users/shen.m/hta_lung_run_hpcell_target_store") |>
+  tar_read(alive_tbl, store = "/vast/scratch/users/shen.m/hta_breast_run_hpcell_target_store") |>
   bind_rows() |>
   dplyr::rename(cell_ = .cell) |>
   select(-cell_type_unified_ensemble)
 
 doublet_cells =
-  tar_read(doublet_tbl, store = "/vast/scratch/users/shen.m/hta_lung_run_hpcell_target_store") |>
+  tar_read(doublet_tbl, store = "/vast/scratch/users/shen.m/hta_breast_run_hpcell_target_store") |>
   bind_rows() |>
   dplyr::rename(cell_ = .cell)
 
 # metacell = 
-#   tar_read(metacell_tbl, store = "/vast/scratch/users/shen.m/hta_lung_run_hpcell_target_store") |> 
+#   tar_read(metacell_tbl, store = "/vast/scratch/users/shen.m/hta_breast_run_hpcell_target_store") |> 
 #   bind_rows() |> 
 #   dplyr::rename(cell_ = cell) |> 
 #   dplyr::rename_with(
@@ -566,7 +576,7 @@ doublet_cells =
 #   )
 
 # Save cell type concensus tbl from HPCell output to disk
-cell_type_concensus_tbl = tar_read(cell_type_concensus_tbl, store = "/vast/scratch/users/shen.m/hta_lung_run_hpcell_target_store") |>  
+cell_type_concensus_tbl = tar_read(cell_type_concensus_tbl, store = "/vast/scratch/users/shen.m/hta_breast_run_hpcell_target_store") |>  
   bind_rows() |> 
   dplyr::rename(cell_ = .cell)
 
@@ -602,7 +612,7 @@ cell_metadata_joined2 = cell_metadata_joined2 |>
               select(sample_id, method_to_apply) |>
               mutate(sample_id = stringr::str_remove(sample_id, ".h5ad")), copy = T) |>
   rename(inverse_transform = method_to_apply)
-  
+
 # Unify cell metadata annotations
 raw_cols <- cell_metadata_joined2 |> colnames()
 pattern_drop <- c(
@@ -630,14 +640,14 @@ cell_metadata_joined2 <- cell_metadata_joined2 |>
 cell_metadata_joined2 |>
   select(!all_of(drop_cols)) |>
   glimpse()
-  
+
 cell_metadata_joined2 |>
   select(!all_of(drop_cols)) |>
-  arrow::write_parquet("/vast/projects/cellxgene_curated/hta/metadata_hta_lung.v0.1.0.parquet",
+  arrow::write_parquet("/vast/projects/cellxgene_curated/hta/metadata_hta_lung_breast.v0.1.0.parquet",
                        compression = "zstd")
 
 # # Cellchat output
-# ligand_receptor_tbl = tar_read(ligand_receptor_tbl, store = "/vast/scratch/users/shen.m/hta_lung_run_hpcell_target_store") |> bind_rows()
+# ligand_receptor_tbl = tar_read(ligand_receptor_tbl, store = "/vast/scratch/users/shen.m/hta_breast_run_hpcell_target_store") |> bind_rows()
 
 # tar_meta(store = my_store, starts_with("sct")) |> pull(name) |> _[[1]] |>
 #   tar_read_raw(store = my_store)
@@ -646,7 +656,7 @@ cell_metadata_joined2 |>
 # Save cpm, rank, sct
 library(targets)
 library(tidyverse)
-store_file_cellNexus = "/vast/scratch/users/shen.m/htan/hta/targets_run_normalised_counts"
+store_file_cellNexus = "/vast/scratch/users/shen.m/htan/hta/targets_run_normalised_counts_v0.2.0"
 
 tar_script({
   library(dplyr)
@@ -719,7 +729,7 @@ tar_script({
     sce |> 
       
       distinct(sample_id) |> mutate(target_name = !!target_name)
-
+    
   }
   
   create_chunks_for_reading_and_saving = function(dataset_id_sample_id, cell_metadata){
@@ -939,11 +949,11 @@ tar_script({
   list(
     
     # The input DO NOT DELETE
-    tar_target(my_store, "/vast/scratch/users/shen.m/hta_lung_run_hpcell_target_store", deployment = "main"), # MODIFY HERE: HPCell targets store to read SCEs from
-    tar_target(cache_directory, "/vast/scratch/users/shen.m/htan/hta_2025/0.1.0", deployment = "main"), # MODIFY HERE: output cache directory for saved anndata files
+    tar_target(my_store, "/vast/scratch/users/shen.m/hta_breast_run_hpcell_target_store", deployment = "main"), # MODIFY HERE: HPCell targets store to read SCEs from
+    tar_target(cache_directory, "/vast/scratch/users/shen.m/htan/hta_2025/0.2.0", deployment = "main"), # MODIFY HERE: output cache directory for saved anndata files
     tar_target(
       cell_metadata,
-      "/vast/projects/cellxgene_curated/hta/metadata_hta_lung.v0.1.0.parquet", # MODIFY HERE: final metadata parquet (should match the COPY TO output above)
+      "/vast/projects/cellxgene_curated/hta/metadata_hta_lung_breast.v0.1.0.parquet", # MODIFY HERE: final metadata parquet (should match the COPY TO output above)
       packages = c( "arrow","dplyr","duckdb")
       
     ),
@@ -1008,21 +1018,21 @@ tar_script({
       packages = c("arrow", "duckdb", "dplyr", "glue", "targets")
       
     ),
-
+    
     tar_target(
       sample_id_sce,
       read_target(target_name_grouped_by_sample_id, my_store, "sce_target_name", "sce"),
       pattern = map(target_name_grouped_by_sample_id),
       packages = c("tidySingleCellExperiment", "SingleCellExperiment", "glue", "tidyverse", "HPCell", "digest", "scater", "dplyr", "duckdb")
     ),
-
+    
     tar_target(
       sample_id_sct,
       read_target(target_name_grouped_by_sample_id, my_store, "sct_target_name", "sct"),
       pattern = map(target_name_grouped_by_sample_id),
       packages = c("tidySingleCellExperiment", "SingleCellExperiment", "glue", "tidyverse", "HPCell", "digest", "scater", "dplyr", "duckdb")
     ),
-
+    
     tar_target(
       saved_sample_cpm,
       save_anndata_cpm(sample_id_sce, paste0(cache_directory, "/cpm")),
@@ -1041,10 +1051,10 @@ tar_script({
       pattern = map(sample_id_sct),
       packages = c("tidySingleCellExperiment", "SingleCellExperiment", "glue", "tidyverse", "HPCell", "digest", "scater", "dplyr", "duckdb")
     )
-
+    
   )
 }, script = paste0(store_file_cellNexus, "_target_script.R"), ask = FALSE)
-    
+
 job::job({
   
   tar_make(
