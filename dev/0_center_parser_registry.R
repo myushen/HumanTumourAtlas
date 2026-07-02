@@ -69,6 +69,7 @@
 
 library(SingleCellExperiment)
 library(zellkonverter)
+library(BiocParallel)
 library(dplyr)
 library(purrr)
 library(stringr)
@@ -117,6 +118,57 @@ finalise_sce <- function(sce, cell_ids = NULL) {
   sce
 }
 
+# OOM-signature patterns from killed BiocParallel children.
+# Extend this list as new variants appear in HPC logs — better to escalate
+# too eagerly on small tiers than to silently error on a genuine OOM.
+.EMPTYDROP_OOM_PATTERNS <- c(
+  "wrong args for environment subassignment"
+)
+
+#' Filter empty droplets from a raw SCE (MTX triplet or 10X HDF5 input).
+#' Applied before any cell-index join so that the cell set passed downstream
+#' contains only real cells.  FDR NAs (very low-count barcodes) are treated as
+#' non-cells, matching DropletUtils documentation.
+#'
+#' Error handling:
+#'   - "no counts available …" → all barcodes are real cells; skip filter.
+#'   - OOM signatures         → exit with status 137 so the targets/mirai
+#'                               backend registers a crash and escalates to a
+#'                               higher-memory HPC tier.
+#'   - Any other error        → re-thrown as a normal target failure.
+filter_empty_droplets <- function(sce, workers = 5) {
+  counts(sce) <- as(counts(sce), "CsparseMatrix")
+  set.seed(100)
+  e.out <- tryCatch(
+    DropletUtils::emptyDrops(
+      counts(sce),
+      BPPARAM = MulticoreParam(workers = workers)
+    ),
+    error = function(e) {
+      msg <- conditionMessage(e)
+      
+      if (grepl("no counts available to estimate the ambient profile", msg,
+                fixed = TRUE)) {
+        message("emptyDrops: all barcodes exceed the ambient threshold — skipping filter.")
+        return(NULL)
+      }
+      
+      is_oom <- any(vapply(.EMPTYDROP_OOM_PATTERNS, grepl, logical(1),
+                           x = msg, ignore.case = TRUE))
+      if (is_oom) {
+        message("emptyDrops: likely OOM in BiocParallel child — exiting with ",
+                "status 137 to trigger mirai resource escalation.")
+        quit(save = "no", status = 137L, runLast = FALSE)
+      }
+      
+      stop(e)
+    }
+  )
+  if (is.null(e.out)) return(sce)
+  is.cell <- !is.na(e.out$FDR) & e.out$FDR <= 0.01
+  sce[, which(is.cell)]
+}
+
 #' Save a single SCE as a gzip-compressed h5ad
 save_h5ad <- function(sample_id, sce, save_directory) {
   if (!dir.exists(save_directory)) dir.create(save_directory, recursive = TRUE)
@@ -150,6 +202,8 @@ parse_HTAPP <- function(sample_id, mtx_path, genes_path, barcodes_path, cell_ind
                          row.names = barcodes)
   )
   
+  sce     <- filter_empty_droplets(sce)
+  
   cd_base <- colData(sce) |> as.data.frame() |> rownames_to_column("old_cell_id")
   
   if (is.null(cell_index_df)) {
@@ -158,7 +212,7 @@ parse_HTAPP <- function(sample_id, mtx_path, genes_path, barcodes_path, cell_ind
   } else {
     # Intersect with L4 filtered barcodes and get global cell index
     cd <- cd_base |>
-      inner_join(cell_index_df, by = c("old_cell_id" = "NAME")) |>
+      inner_join(cell_index_df, by = c("old_cell_id" = "NAME", "sample_id")) |>
       dplyr::rename(cell_id = cell_index)
     if (nrow(cd) == 0) return(NULL)
   }
@@ -204,7 +258,7 @@ parse_BU <- function(counts_path, biospecimen, cell_index_df) {
   sce$sample_id <- biospecimen
   
   cd <- colData(sce) |> as.data.frame() |> rownames_to_column("old_cell_id") |>
-    inner_join(cell_index_df, by = c("old_cell_id" = "NAME")) |>
+    inner_join(cell_index_df, by = c("old_cell_id" = "NAME", "sample_id"="SampleID")) |>
     dplyr::rename(cell_id = cell_index)
   
   if (nrow(cd) == 0) return(NULL)
@@ -284,8 +338,10 @@ parse_OHSU <- function(h5_path, sample_id, cell_index_df) {
   sce <- DropletUtils::read10xCounts(h5_path, type = "HDF5", col.names = TRUE)
   sce$sample_id <- sample_id
   
+  sce <- filter_empty_droplets(sce)
+  
   cd <- colData(sce) |> as.data.frame() |> rownames_to_column("old_cell_id") |>
-    inner_join(cell_index_df, by = c("old_cell_id" = "NAME")) |>
+    inner_join(cell_index_df, by = c("old_cell_id" = "NAME", "sample_id")) |>
     dplyr::rename(cell_id = cell_index)
   
   if (nrow(cd) == 0) return(NULL)
@@ -350,7 +406,7 @@ parse_WUSTL <- function(sample_id, l4_rds_path, cell_index_df) {
   )
   
   cd <- colData(sce) |> as.data.frame() |> tibble::rownames_to_column("old_cell_id") |>
-    dplyr::inner_join(cell_index_df, by = c("old_cell_id" = "NAME")) |>
+    dplyr::inner_join(cell_index_df, by = c("old_cell_id" = "NAME"), "sample_id") |>
     dplyr::rename(cell_id = cell_index)
   
   if (nrow(cd) == 0) return(NULL)
@@ -440,7 +496,7 @@ parse_Duke_seurat <- function(l4_rds_path, cell_index_df) {
         dplyr::select(NAME, cell_index)
       
       cd <- colData(sce) |> as.data.frame() |> tibble::rownames_to_column("old_cell_id") |>
-        dplyr::inner_join(cid, by = c("old_cell_id" = "NAME")) |>
+        dplyr::inner_join(cid, by = c("old_cell_id" = "NAME", "sample_id")) |>
         dplyr::rename(cell_id = cell_index)
       
       if (nrow(cd) == 0) return(NULL)
@@ -465,8 +521,10 @@ parse_Duke <- function(sample_id, mtx_path, genes_path, barcodes_path,
                          row.names = barcodes)
   )
   
+  sce <- filter_empty_droplets(sce)
+  
   cd <- colData(sce) |> as.data.frame() |> tibble::rownames_to_column("old_cell_id") |>
-    dplyr::inner_join(cell_index_df, by = c("old_cell_id" = "NAME")) |>
+    dplyr::inner_join(cell_index_df, by = c("old_cell_id" = "NAME", "sample_id")) |>
     dplyr::rename(cell_id = cell_index)
   
   if (nrow(cd) == 0) return(NULL)
@@ -485,8 +543,10 @@ parse_DFCI <- function(h5_path, sample_id, cell_index_df) {
   sce <- DropletUtils::read10xCounts(h5_path, type = "HDF5", col.names = TRUE)
   sce$sample_id <- sample_id
   
+  sce <- filter_empty_droplets(sce)
+  
   cd <- colData(sce) |> as.data.frame() |> rownames_to_column("old_cell_id") |>
-    inner_join(cell_index_df, by = c("old_cell_id" = "NAME")) |>
+    inner_join(cell_index_df, by = c("old_cell_id" = "NAME", "sample_id")) |>
     dplyr::rename(cell_id = cell_index)
   
   if (nrow(cd) == 0) return(NULL)

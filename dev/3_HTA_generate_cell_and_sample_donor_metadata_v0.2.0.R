@@ -128,7 +128,7 @@ tar_script({
         file_id_cellNexus_pseudobulk  = file_id_cellNexus_single_cell
       ) |>
       dplyr::select(
-        cell_id, sample_id,
+        cell_id, sample_id, contains("barcode"),
         file_id_cellNexus_single_cell, file_id_cellNexus_pseudobulk,
         dplyr::contains("cell_type")
       )
@@ -168,57 +168,59 @@ job::job({
 
 cell_metadata <- tar_read(cell_data_list, store = store_file_hta_cell_metadata) |>
   dplyr::bind_rows() |>
-  mutate(cell_id = as.numeric(cell_id))
+  mutate(cell_id = as.numeric(cell_id)) |>
+  mutate(barcode = coalesce(barcode, Barcode)) |>
+  select(-Barcode)
 
-
+# This probably does not matter, because all index were assigned in 2_HTAN_parse_all_centers_targets.R
 # Store produced by 2_HTAN_parse_all_centers_targets.R  (organ = "breast",
 # but the pipeline covers BOTH lung and breast)
-store_all_centers <- "~/scratch/htan/breast_all_centers_target_store"
-
-# --- HTAPP ---------------------------------------------------------------
-htapp_index <- tar_read(htapp_cell_index_full_df, store = store_all_centers) |>
-  dplyr::rename(.cell = NAME)
-
-# --- BU ------------------------------------------------------------------
-bu_index <- tar_read(bu_cell_index_df, store = store_all_centers) |>
-  dplyr::rename(.cell = NAME, sample_id = SampleID)
-
-# --- MSK -----------------------------------------------------------------
-msk_index <- tar_read(msk_cell_index_df, store = store_all_centers) |>
-  dplyr::select(.cell, sample_id, cell_index)
-
-# --- OHSU ----------------------------------------------------------------
-ohsu_index <- tar_read(ohsu_cell_index_df, store = store_all_centers) |>
-  dplyr::rename(.cell = NAME)
-
-# --- WUSTL  (patterned target → list; bind_rows needed) -----------------
-wustl_index <- tar_read(wustl_cell_index_df, store = store_all_centers) |>
-  dplyr::bind_rows() |>
-  dplyr::rename(.cell = NAME)
-
-# --- Duke ----------------------------------------------------------------
-duke_index <- tar_read(duke_cell_index_df, store = store_all_centers) |>
-  dplyr::rename(.cell = NAME)
-
-# --- DFCI ----------------------------------------------------------------
-dfci_index <- tar_read(dfci_cell_index_df, store = store_all_centers) |>
-  dplyr::rename(.cell = NAME)
-
-# Combined index: numeric cell_index → original barcode (.cell) per sample
-cell_index_map <- dplyr::bind_rows(
-  htapp_index,
-  bu_index,
-  msk_index,
-  ohsu_index,
-  wustl_index,
-  duke_index,
-  dfci_index
-) |>
-  mutate(cell_index = as.numeric(cell_index))
-
-# Attach original barcodes to cell metadata. This probably do not matter because cell index has been assigned to h5ad
-cell_metadata <- cell_metadata |>
-  dplyr::left_join(cell_index_map, by = c("cell_id" = "cell_index", "sample_id"))
+# store_all_centers <- "/vast/scratch/users/shen.m/htan/breast_all_centers_target_store"
+# 
+# # --- HTAPP ---------------------------------------------------------------
+# htapp_index <- tar_read(htapp_cell_index_full_df, store = store_all_centers) |>
+#   dplyr::rename(.cell = NAME)
+# 
+# # --- BU ------------------------------------------------------------------
+# bu_index <- tar_read(bu_cell_index_df, store = store_all_centers) |>
+#   dplyr::rename(.cell = NAME, sample_id = SampleID)
+# 
+# # --- MSK -----------------------------------------------------------------
+# msk_index <- tar_read(msk_cell_index_df, store = store_all_centers) |>
+#   dplyr::select(.cell, sample_id, cell_index)
+# 
+# # --- OHSU ----------------------------------------------------------------
+# ohsu_index <- tar_read(ohsu_cell_index_df, store = store_all_centers) |>
+#   dplyr::rename(.cell = NAME)
+# 
+# # --- WUSTL  (patterned target → list; bind_rows needed) -----------------
+# wustl_index <- tar_read(wustl_cell_index_df, store = store_all_centers) |>
+#   dplyr::bind_rows() |>
+#   dplyr::rename(.cell = NAME)
+# 
+# # --- Duke ----------------------------------------------------------------
+# duke_index <- tar_read(duke_cell_index_df, store = store_all_centers) |>
+#   dplyr::rename(.cell = NAME)
+# 
+# # --- DFCI ----------------------------------------------------------------
+# dfci_index <- tar_read(dfci_cell_index_df, store = store_all_centers) |>
+#   dplyr::rename(.cell = NAME)
+# 
+# # Combined index: numeric cell_index → original barcode (.cell) per sample
+# cell_index_map <- dplyr::bind_rows(
+#   htapp_index,
+#   bu_index,
+#   msk_index,
+#   ohsu_index,
+#   wustl_index,
+#   duke_index,
+#   dfci_index
+# ) |>
+#   mutate(cell_index = as.numeric(cell_index))
+# 
+# # Attach original barcodes to cell metadata. This probably do not matter because cell index has been assigned to h5ad
+# cell_metadata <- cell_metadata |>
+#   dplyr::left_join(cell_index_map, by = c("cell_id" = ".cell", "sample_id"))
 
 cell_metadata |> arrow::write_parquet("/vast/scratch/users/shen.m/htan/cell_metadata_v0.2.0.parquet")
 
@@ -227,7 +229,7 @@ dplyr::tbl(
   dplyr::sql("SELECT * FROM read_parquet('/vast/scratch/users/shen.m/htan/cell_metadata_v0.2.0.parquet')")
 )
 
-rm(bu_index, cell_index_map, dfci_index, duke_index, htapp_index, msk_index, wustl_index, ohsu_index)
+rm(list = ls(pattern = "index$"))
 gc()
 
 # =============================================================================
@@ -370,8 +372,7 @@ cell_sample_metadata <- cell_tbl |>
     sex   = dplyr::if_else(is.na(sex),   "unknown",   sex),
     assay = dplyr::if_else(is.na(assay), "scRNA-seq", assay),
     atlas_id = "hta_2025/0.2.0"
-  ) |> 
-  select(-.cell)
+  )
 
 duckdb_write_parquet <- function(.tbl_sql, path, con) {
   sql_tbl  <- dbplyr::sql_render(.tbl_sql)

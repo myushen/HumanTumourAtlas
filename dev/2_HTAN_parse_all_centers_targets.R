@@ -28,7 +28,7 @@ output_dir       <- "/vast/scratch/users/shen.m/htan/hta_2025/0.2.0/counts/"
 msk_map_id_path  <- "/vast/scratch/users/shen.m/synapse_data/lung/counts/adata_sample_id_htan_id_map.csv"
 # ─────────────────────────────────────────────────────────────────────────────
 
-store <- paste0("~/scratch/htan/", organ, "_all_centers_target_store")
+store <- paste0("/vast/scratch/users/shen.m/htan/", organ, "_all_centers_target_store")
 
 tar_script({
   
@@ -116,7 +116,7 @@ tar_script({
     # ══════════════════════════════════════════════════════════════════════
     # HTAN HTAPP  (HTA1) — L3 MTX + L4 TSV
     # ══════════════════════════════════════════════════════════════════════
-
+    
     tar_target(
       htapp_cell_index_df,
       {
@@ -126,12 +126,12 @@ tar_script({
           select(sample_id = Biospecimen, processed_file = full_path) |>
           tidyr::separate_rows(sample_id, sep = ",\\s*") |>
           distinct()  
-
+        
         build_htapp_cell_index(l4_files)
       },
       packages = c("dplyr", "purrr")
     ),
-
+    
     # Extend htapp_cell_index_df with sequential fallback indices for any
     # sample that has L3 MTX files but no corresponding L4 TSV entry.
     tar_target(
@@ -190,13 +190,13 @@ tar_script({
       },
       packages = c("dplyr", "tidyr", "stringr", "purrr")
     ),
-
+    
     tar_target(
       htapp_metadata_grouped,
       htapp_metadata |> group_by(sample_id) |> tar_group(),
       iteration = "group"
     ),
-
+    
     tar_target(
       htapp_sce,
       {
@@ -214,7 +214,7 @@ tar_script({
       packages  = c("SingleCellExperiment", "Seurat", "dplyr", "tibble"),
       resources = tar_resources(crew = tar_resources_crew(controller = "elastic_20"))
     ),
-
+    
     tar_target(
       save_htapp,
       {
@@ -415,19 +415,19 @@ tar_script({
       packages = c("zellkonverter")
     )
     ,
-
+    
     # ══════════════════════════════════════════════════════════════════════
     # HTAN OHSU  (HTA9) — L3 10X HDF5, 1:1 per biospecimen  [Breast]
     # ══════════════════════════════════════════════════════════════════════
-
+    
     tar_target(
       ohsu_metadata,
       file_metadata |>
-        filter(Atlas.Name == "HTAN OHSU", Level == "Level 3",
+        filter(Atlas.Name == "HTAN OHSU", Level == "Level 3", # Use Level 3 here because Level 4 anndata doesnt hold meaningful colData
                File.Format == "hdf5") |>
         select(full_path, sample_id = Biospecimen)
     ),
-
+    
     tar_target(
       ohsu_metadata_grouped,
       ohsu_metadata |> group_by(sample_id) |> tar_group(),
@@ -455,7 +455,7 @@ tar_script({
       iteration = "list",
       packages  = c("SingleCellExperiment", "DropletUtils", "dplyr")
     ),
-
+    
     tar_target(
       save_ohsu,
       {
@@ -465,7 +465,7 @@ tar_script({
       pattern  = map(ohsu_sce),
       packages = c("zellkonverter")
     ),
-
+    
     # ══════════════════════════════════════════════════════════════════════
     # HTAN WUSTL  (HTA12) — L4 per-sample Seurat RDS  [Breast]
     # L3 MTX not used; RNA assay counts extracted from each RDS directly.
@@ -633,7 +633,7 @@ tar_script({
     # ══════════════════════════════════════════════════════════════════════
     # HTAN DFCI  (HTA5) — POOLED, no cell-level demultiplexing
     # ══════════════════════════════════════════════════════════════════════
-
+    
     tar_target(
       dfci_metadata,
       file_metadata |>
@@ -647,7 +647,7 @@ tar_script({
       dfci_metadata |> group_by(sample_id) |> tar_group(),
       iteration = "group"
     ),
-
+    
     tar_target(
       dfci_cell_index_df,
       build_dfci_cell_index(
@@ -655,7 +655,7 @@ tar_script({
       ),
       packages = c("dplyr", "purrr", "tibble", "rhdf5")
     ),
-
+    
     tar_target(
       dfci_sce,
       {
@@ -669,7 +669,7 @@ tar_script({
       iteration = "list",
       packages  = c("SingleCellExperiment", "DropletUtils", "dplyr")
     ),
-
+    
     tar_target(
       save_dfci,
       {
@@ -679,7 +679,7 @@ tar_script({
       pattern  = map(dfci_sce),
       packages = c("zellkonverter")
     )
-
+    
   )
   
 }, script = paste0(store, "_target_script.R"), ask = FALSE)
@@ -693,5 +693,5 @@ job::job({
   )
 })
 
-tar_workspace(save_duke_l4_bc70e216b71c6929,store = store, script   = paste0(store, "_target_script.R"))
+tar_workspace(duke_l3_sce_efd06531aaf7372e, store = store, script   = paste0(store, "_target_script.R"))
 tar_progress_branches(store = store) |> mutate(pending = branches - skipped - completed)
