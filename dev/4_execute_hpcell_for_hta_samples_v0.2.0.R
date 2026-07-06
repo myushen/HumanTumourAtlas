@@ -1124,6 +1124,8 @@ tar_progress_branches(store = store_file_cellNexus) |> mutate(pending = branches
 
 # Testing 
 library(cellNexus)
+library(tidyr)
+library(ggplot2)
 x = get_metadata(cloud_metadata = NULL, local_metadata = "/vast/projects/cellxgene_curated/hta/metadata_hta_lung_breast.v0.1.0.parquet")
 x |> dplyr::count()
 x |> count(empty_droplet, alive, scDblFinder.class)
@@ -1142,16 +1144,31 @@ df_long <- x |>
   ) |>
   filter(!is.na(value))   # drops alive/scDblFinder.class rows where empty_droplet == TRUE
 
-# 2. Count per tissue x annotation x value
-counts <- df_long |>
-  count(tissue_groups, annotation, value, name = "n") |>
-  group_by(tissue_groups, annotation) |>
-  mutate(pct = n / sum(n) * 100) |>
-  ungroup()
 
-ggplot(counts, aes(x = annotation, y = pct, fill = value)) +
+# Visualise all QC
+all_summary <- df_long |>
+  count(annotation, value, name = "n") |>
+  group_by(annotation) |>
+  mutate(pct = n / sum(n) * 100) |>
+  ungroup() |>
+  filter(
+      (annotation == "empty_droplet" & value == "true")  |
+        (annotation == "alive" & value == "false")          |
+        (annotation == "scDblFinder.class" & value == "doublet")
+    )
+
+
+# # Visualise per tissue QC
+# per_tissue_summary <- counts |>
+#   filter(
+#     (annotation == "empty_droplet" & value == "true")  |
+#       (annotation == "alive" & value == "false")          |
+#       (annotation == "scDblFinder.class" & value == "doublet")
+#   )
+
+
+ggplot(all_summary, aes(x = annotation, y = pct, fill = value)) +
   geom_col(position = "dodge") +
-  facet_wrap(~ tissue_groups) +
   labs(x = NULL, y = "% of cells", fill = NULL) +
   theme_bw() +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
