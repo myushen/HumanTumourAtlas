@@ -5,14 +5,17 @@ library(synapser)
 library(dplyr)
 library(purrr)
 
-# Lung tissue metadata is download from 
-# https://data.humantumoratlas.org/explore?selectedFilters=%5B%7B%22value%22%3A%22scRNA-seq%22%2C%22group%22%3A%22assayName%22%2C%22count%22%3A1832%2C%22isSelected%22%3Afalse%7D%2C%7B%22value%22%3A%22Synapse%22%2C%22group%22%3A%22downloadSource%22%2C%22count%22%3A656%2C%22isSelected%22%3Afalse%7D%2C%7B%22value%22%3A%22Lung%22%2C%22group%22%3A%22organType%22%2C%22count%22%3A942%2C%22isSelected%22%3Afalse%7D%2C%7B%22value%22%3A%22csv%22%2C%22group%22%3A%22FileFormat%22%2C%22count%22%3A606%2C%22isSelected%22%3Afalse%7D%2C%7B%22value%22%3A%22hdf5%22%2C%22group%22%3A%22FileFormat%22%2C%22count%22%3A13%2C%22isSelected%22%3Afalse%7D%2C%7B%22value%22%3A%22mtx%22%2C%22group%22%3A%22FileFormat%22%2C%22count%22%3A144%2C%22isSelected%22%3Afalse%7D%2C%7B%22value%22%3A%22tsv%22%2C%22group%22%3A%22FileFormat%22%2C%22count%22%3A103%2C%22isSelected%22%3Afalse%7D%5D
+# Metadata is download from HTAN website
+# https://humantumoratlas.org/explore?selectedFilters=%5B%7B%22value%22%3A%22scRNA-seq%22%2C%22group%22%3A%22assayName%22%2C%22count%22%3A126%2C%22isSelected%22%3Afalse%7D%2C%7B%22value%22%3A%22Level+3%22%2C%22group%22%3A%22level%22%2C%22count%22%3A13%2C%22isSelected%22%3Afalse%7D%2C%7B%22value%22%3A%22Level+4%22%2C%22group%22%3A%22level%22%2C%22count%22%3A48%2C%22isSelected%22%3Afalse%7D%2C%7B%22value%22%3A%22Synapse%22%2C%22group%22%3A%22downloadSource%22%2C%22count%22%3A4562%2C%22isSelected%22%3Afalse%7D%5D
+# Filters:
+#    - scRNA-seq Assay
+#    - Level 3 or 4
+#    - Synapse Data Access
+# Downloaded biospecimens (sample_meta), cases (donor_meta), and files (file_meta) metadata separately.
 
-# To do: what's streamline way of crawling metadata from HTAN API?
-
-sample_meta <- read.csv("inst/extdata/samples_metadata_2025_10_21.tsv", sep = "\t", na.strings = c("NA",""), header = TRUE) |> head(2)
-donor_meta <- read.csv("inst/extdata/donors_metadata_2025_10_21.tsv", sep = "\t", na.strings = c("NA",""), header = TRUE) |> head(2)
-file_meta <- read.csv("inst/extdata/files_metadata_2025_10_21.tsv", sep = "\t", na.strings = c("NA",""), header = TRUE) |> head(2)
+sample_meta <- read.csv("inst/extdata/samples_metadata_scRNAseq_synapse_level3_4.tsv", sep = "\t", na.strings = c("NA",""), header = TRUE) |> head(2)
+donor_meta <- read.csv("inst/extdata/donors_metadata_scRNAseq_synapse_level3_4.tsv", sep = "\t", na.strings = c("NA",""), header = TRUE) |> head(2)
+file_meta <- read.csv("inst/extdata/files_metadata_scRNAseq_synapse_level3_4.tsv", sep = "\t", na.strings = c("NA",""), header = TRUE) |> head(2)
 
 # Log in to Synapse, create your own token, and save to Renviron
 if (!nzchar(Sys.getenv("SYNAPSE_TOKEN", unset = ""))) {
@@ -27,7 +30,7 @@ if (!nzchar(Sys.getenv("SYNAPSE_TOKEN", unset = ""))) {
 
 # Start downloading using targets
 
-lung_counts_download_target_store = "/vast/scratch/users/shen.m/download_lung_counts_synapse_data_target_store"
+download_htan_scRNAseq_l3_l4_synapse_target_store = "/vast/scratch/users/shen.m/download_htan_scRNAseq_l3_l4_synapse_target_store"
 
 # Define target for each synapse ID
 tar_script({
@@ -75,7 +78,7 @@ tar_script({
     storage = "worker", 
     retrieval = "worker", 
     error = "continue", 
-    cue = tar_cue(mode = "never"),
+    cue = tar_cue(mode = "thorough"),
     format = "qs",
     #debug = "dataset_id_sct_ea377f6e2d0ae2b7",
     workspace_on_error = TRUE,
@@ -89,39 +92,61 @@ tar_script({
   # Read file and get id
   get_download_ids <- function(df_path) {
     df = read.csv(df_path, sep = "\t", na.strings = c("NA",""), header = TRUE)
-    ids = df |> pull(Synapse.Id) |> unique()
+    df |> distinct(Synapse.Id, Atlas.Name) |>
+      mutate(Atlas.Name = sub(" ", "_", Atlas.Name))
   }
   
   # Function to download data from Synapse
-  download_synapse_data <- function(id, save_directory) {
+  download_synapse_data <- function(id, center_id, save_directory) {
     set.seed(123)
     
     if (!dir.exists(save_directory)) {
       dir.create(save_directory, recursive = TRUE)
     }
     
-    synLogin(authToken =  Sys.getenv("SYNAPSE_TOKEN"))
-    synGet(entity = id, downloadLocation = save_directory)
+    out_dir <- file.path(save_directory, center_id)
+    if (!dir.exists(out_dir)) {
+      dir.create(out_dir, recursive = TRUE)
+    }
+    
+    synLogin(authToken = Sys.getenv("SYNAPSE_TOKEN"))
+    synGet(entity = id, downloadLocation = out_dir)
     print("saved successfully.. ")
   }
   
   list(
     tar_target(
       file_metadata,
-      "/home/users/allstaff/shen.m/git_control/HumanTumourAtlas/inst/extdata/files_metadata_2025_10_21.tsv",
+      "/home/users/allstaff/shen.m/git_control/HumanTumourAtlas/inst/extdata/files_metadata_scRNAseq_synapse_level3_4.tsv",
       deployment = "main"
     ),
     
     tar_target(
-      synapse_id,
+      synapse_df,
       get_download_ids(file_metadata),
+      # |>
+      #   filter(Atlas.Name == "HTAN_BU"),
       deployment = "main"
       ),
+    
+    tar_target(
+      synapse_id,
+      synapse_df$Synapse.Id,
+      deployment = "main"
+    ),
+    
+    tar_target(
+      atlas_name,
+      synapse_df$Atlas.Name,
+      deployment = "main"
+    ),
+    
     tar_target(
       download_data,
       download_synapse_data(synapse_id,
-                            "/vast/scratch/users/shen.m/synapse_data/lung/counts"),
-      pattern = map(synapse_id),
+                            atlas_name,
+                            "/vast/scratch/users/shen.m/synapse_data"),
+      pattern = map(synapse_id, atlas_name),
       resources = tar_resources(
         crew = tar_resources_crew(controller = "elastic_5_minimal")
       ) 
@@ -129,15 +154,18 @@ tar_script({
   )
         
   
-}, script = paste0(lung_counts_download_target_store, "_target_script.R"), ask = FALSE)
+}, script = paste0(download_htan_scRNAseq_l3_l4_synapse_target_store, "_target_script.R"), ask = FALSE)
 
 job::job({
   
   tar_make(
-    script = paste0(lung_counts_download_target_store, "_target_script.R"), 
-    store = lung_counts_download_target_store, 
+    script = paste0(download_htan_scRNAseq_l3_l4_synapse_target_store, "_target_script.R"), 
+    store = download_htan_scRNAseq_l3_l4_synapse_target_store, 
     reporter = "summary"
   )
   
 })
+
+tar_progress_branches(store = download_htan_scRNAseq_l3_l4_synapse_target_store)
+
 
