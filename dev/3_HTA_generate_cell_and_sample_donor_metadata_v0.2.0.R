@@ -32,7 +32,7 @@
 #
 # 4. Combined metadata:
 #    - Joins cell → barcode map → sample/donor annotations
-#    - Adds atlas_id = "hta_2025/0.2.0"
+#    - Adds atlas_id = "hta_2026/0.3.0"
 #    - Saves as ZSTD-compressed parquet
 #
 # Output files:
@@ -138,7 +138,7 @@ tar_script({
     tar_target(
       h5ad_files,
       list.files(
-        "/vast/scratch/users/shen.m/htan/hta_2025/0.3.0/parsed_counts/",
+        "/vast/scratch/users/shen.m/htan/hta_2026/0.3.0/parsed_counts/",
         pattern   = "\\.h5ad$",
         full.names = TRUE
       )
@@ -313,7 +313,7 @@ file_metadata <- file_metadata_raw |>
   )
 
 #  (Investigate further) Biospecimen, center id not parsed
-# existing_ids <- list.files("/vast/scratch/users/shen.m/htan/hta_2025/0.3.0/parsed_counts/")
+# existing_ids <- list.files("/vast/scratch/users/shen.m/htan/hta_2026/0.3.0/parsed_counts/")
 # file_metadata |>
 #   filter(file_id_cellNexus_single_cell %in% existing_ids) |>
 #   dplyr::count(Atlas.Name)
@@ -410,7 +410,7 @@ cell_sample_metadata <- cell_tbl |>
     self_reported_ethnicity = dplyr::if_else(is.na(self_reported_ethnicity), "unknown", self_reported_ethnicity),
     sex   = dplyr::if_else(is.na(sex),   "unknown",   sex),
     assay = dplyr::if_else(is.na(assay), "scRNA-seq", assay),
-    atlas_id = "hta_2025/0.3.0"
+    atlas_id = "hta_2026/0.3.0"
   )
 
 duckdb_write_parquet <- function(.tbl_sql, path, con) {

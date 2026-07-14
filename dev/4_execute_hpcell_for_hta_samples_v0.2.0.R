@@ -156,7 +156,7 @@ tar_script({
     tar_target(
       files,
       list.files(
-        "/vast/scratch/users/shen.m/htan/hta_2025/0.3.0/parsed_counts/",
+        "/vast/scratch/users/shen.m/htan/hta_2026/0.3.0/parsed_counts/",
         full.names = TRUE, pattern = "\\.h5ad$"
       ) |>
         # Temporary fix - 0 Biospecimens should not be parsed
@@ -269,7 +269,7 @@ sample_summary_df = sample_summary_df |> impute_x_approximate_distribution(0.25,
 
 
 sample_summary_df <- sample_summary_df |>
-  mutate(file_name = file.path("/vast/scratch/users/shen.m/htan/hta_2025/0.3.0/parsed_counts/", 
+  mutate(file_name = file.path("/vast/scratch/users/shen.m/htan/hta_2026/0.3.0/parsed_counts/", 
                                sample_id),
          feature_thresh = if_else(n_genes > 1e3, 200, floor(500/2e4)*n_genes)) |>
   select(file_name, sample_id, method_to_apply, count_upper_bound, feature_thresh)
@@ -653,7 +653,7 @@ cell_metadata_joined2 |>
   glimpse()
 
 # Write via DuckDB COPY TO — streams directly to parquet without materialising in R RAM
-output_path <- "/vast/projects/cellxgene_curated/hta/metadata_hta.v0.1.0.parquet"
+output_path <- "/vast/projects/cellxgene_curated/hta/hta_2026.v0.1.0.parquet"
 final_sql <- dbplyr::sql_render(cell_metadata_joined2 |> select(!all_of(drop_cols)))
 DBI::dbExecute(con, sprintf(
   "COPY (%s) TO '%s' (FORMAT PARQUET, COMPRESSION 'zstd')",
@@ -984,10 +984,10 @@ tar_script({
     
     # The input DO NOT DELETE
     tar_target(my_store, "/vast/scratch/users/shen.m/hta_all_centers_run_hpcell_target_store", deployment = "main"), # MODIFY HERE: HPCell targets store to read SCEs from
-    tar_target(cache_directory, "/vast/scratch/users/shen.m/hta_2025/0.3.0", deployment = "main"), # MODIFY HERE: output cache directory for saved anndata files
+    tar_target(cache_directory, "/vast/scratch/users/shen.m/hta_2026/0.3.0", deployment = "main"), # MODIFY HERE: output cache directory for saved anndata files
     tar_target(
       cell_metadata,
-      "/vast/projects/cellxgene_curated/hta/metadata_hta.v0.1.0.parquet", # MODIFY HERE: final metadata parquet (should match the COPY TO output above)
+      "/vast/projects/cellxgene_curated/hta/hta_2026.v0.1.0.parquet", # MODIFY HERE: final metadata parquet (should match the COPY TO output above)
       packages = c( "arrow","dplyr","duckdb")
       
     ),
@@ -1130,7 +1130,7 @@ tar_progress_branches(store = store_file_cellNexus) |> mutate(pending = branches
 library(cellNexus)
 library(tidyr)
 library(ggplot2)
-x = get_metadata(cloud_metadata = NULL, local_metadata = "/vast/projects/cellxgene_curated/hta/metadata_hta.v0.1.0.parquet")
+x = get_metadata(cloud_metadata = NULL, local_metadata = "/vast/projects/cellxgene_curated/hta/hta_2026.v0.1.0.parquet")
 x |> dplyr::count()
 
 qc_summary <- x |>

@@ -25,7 +25,7 @@ library(dplyr)
 organ            <- "all_centers"     # used only for naming the store
 files_meta_path  <- "inst/extdata/files_metadata_scRNAseq_synapse_level3_4.tsv"
 downloaded_dir   <- "/vast/scratch/users/shen.m/synapse_data/"   # center_id subdirs live here
-output_dir       <- "/vast/scratch/users/shen.m/htan/hta_2025/0.3.0/parsed_counts/"
+output_dir       <- "/vast/scratch/users/shen.m/htan/hta_2026/0.3.0/parsed_counts/"
 msk_map_id_path  <- "/vast/scratch/users/shen.m/synapse_data/breast_lung_combined/counts/adata_sample_id_htan_id_map.csv"
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -46,7 +46,7 @@ tar_script({
   #organ            <- "breast"          # used only for naming the store
   files_meta_path  <- "/home/users/allstaff/shen.m/git_control/HumanTumourAtlas/inst/extdata/files_metadata_scRNAseq_synapse_level3_4.tsv"
   downloaded_dir   <- "/vast/scratch/users/shen.m/synapse_data/"
-  output_dir       <- "/vast/scratch/users/shen.m/htan/hta_2025/0.3.0/parsed_counts/"
+  output_dir       <- "/vast/scratch/users/shen.m/htan/hta_2026/0.3.0/parsed_counts/"
   msk_map_id_path  <- "/vast/scratch/users/shen.m/synapse_data/breast_lung_combined/counts/adata_sample_id_htan_id_map.csv"
   
   # ── SLURM controllers (small → large with fallback) ─────────────────────
