@@ -13,7 +13,7 @@ library(SummarizedExperiment)
 
 cell_metadata <-  tbl(
   dbConnect(duckdb::duckdb(), dbdir = ":memory:"),
-  sql("SELECT * FROM read_parquet('/vast/scratch/users/shen.m/htan/hta_metadata.0.2.0.parquet')")
+  sql("SELECT * FROM read_parquet('/vast/scratch/users/shen.m/htan/hta_metadata.0.3.0.parquet')")
 )
 # sce = cell_metadata |>
 #   dplyr::filter(sample_id == "HTA1_203_332102"  ) |>
@@ -22,7 +22,7 @@ cell_metadata <-  tbl(
 # sce |> counts() |> as.matrix() |>  hist(ylim=c(0,1e3), breaks = 50)
 
 #breast_cell_metadata <- cell_metadata |> filter(is.na(tissue) | str_detect(tissue, "breast|Breast"))
-summary_store = "/vast/scratch/users/shen.m/hta_breast_check_counts_distribution_summary_target_store"
+summary_store = "/vast/scratch/users/shen.m/hta_check_counts_distribution_summary_target_store"
 tar_script({
   library(dplyr)
   library(SummarizedExperiment)
@@ -156,9 +156,11 @@ tar_script({
     tar_target(
       files,
       list.files(
-        "/vast/scratch/users/shen.m/htan/hta_2025/0.2.0/counts/",
+        "/vast/scratch/users/shen.m/htan/hta_2025/0.3.0/parsed_counts/",
         full.names = TRUE, pattern = "\\.h5ad$"
-      ),
+      ) |>
+        # Temporary fix - 0 Biospecimens should not be parsed
+        (\(x) x[basename(x) != "0 Biospecimens.h5ad"])(),
       deployment = "main"
     ),
     
@@ -267,13 +269,13 @@ sample_summary_df = sample_summary_df |> impute_x_approximate_distribution(0.25,
 
 
 sample_summary_df <- sample_summary_df |>
-  mutate(file_name = file.path("/vast/scratch/users/shen.m/htan/hta_2025/0.2.0/counts/", 
+  mutate(file_name = file.path("/vast/scratch/users/shen.m/htan/hta_2025/0.3.0/parsed_counts/", 
                                sample_id),
          feature_thresh = if_else(n_genes > 1e3, 200, floor(500/2e4)*n_genes)) |>
   select(file_name, sample_id, method_to_apply, count_upper_bound, feature_thresh)
 
-sample_summary_df |> arrow::write_parquet("/vast/projects/cellxgene_curated/hta/lung_breast_sample_summary_df_for_hpcell.parquet", compression = "gzip")
-sample_summary_df <- arrow::read_parquet("/vast/projects/cellxgene_curated/hta/lung_breast_sample_summary_df_for_hpcell.parquet")
+sample_summary_df |> arrow::write_parquet("/vast/projects/cellxgene_curated/hta/all_center_sample_summary_df_for_hpcell.parquet", compression = "gzip")
+sample_summary_df <- arrow::read_parquet("/vast/projects/cellxgene_curated/hta/all_center_sample_summary_df_for_hpcell.parquet")
 
 sample_names <-
   sample_summary_df |> 
@@ -284,7 +286,7 @@ functions = sample_summary_df |> pull(method_to_apply)
 feature_thresh = sample_summary_df |> pull(feature_thresh)
 count_upper_bound = sample_summary_df |> pull(count_upper_bound)
 
-my_store = "/vast/scratch/users/shen.m/hta_lung_breast_run_hpcell_target_store"
+my_store = "/vast/scratch/users/shen.m/hta_all_centers_run_hpcell_target_store"
 
 new_elastic <- function(name, mem_gb, time_min, workers, crashes_max, cpus_per_task = 1, backup = NULL) {
   crew_controller_slurm(
@@ -483,7 +485,7 @@ tar_script({
   list(
     
     # The input DO NOT DELETE
-    tar_target(my_store, "/vast/scratch/users/shen.m/hta_lung_breast_run_hpcell_target_store", deployment = "main"),
+    tar_target(my_store, "/vast/scratch/users/shen.m/hta_all_centers_run_hpcell_target_store", deployment = "main"),
     
     tar_target(
       target_name,
@@ -507,13 +509,13 @@ tar_script({
   )
   
   
-}, script = "/vast/scratch/users/shen.m/hta_lung_breast_lighten_annotation_tbl_target.R", ask = FALSE)
+}, script = "/vast/scratch/users/shen.m/hta_lighten_annotation_tbl_target.R", ask = FALSE)
 
 job::job({
   
   tar_make(
-    script = "/vast/scratch/users/shen.m/hta_lung_breast_lighten_annotation_tbl_target.R",
-    store = "/vast/scratch/users/shen.m/hta_lung_breast_lighten_annotation_tbl_target", 
+    script = "/vast/scratch/users/shen.m/hta_lighten_annotation_tbl_target.R",
+    store = "/vast/scratch/users/shen.m/hta_lighten_annotation_tbl_target", 
     reporter = "summary"
   )
   
@@ -531,11 +533,11 @@ con <- dbConnect(duckdb::duckdb(), dbdir = ":memory:")
 cell_metadata <- 
   tbl(
     con,
-    sql("SELECT * FROM read_parquet('/vast/scratch/users/shen.m/htan/hta_metadata.0.2.0.parquet')")
+    sql("SELECT * FROM read_parquet('/vast/scratch/users/shen.m/htan/hta_metadata.0.3.0.parquet')")
   )
 
 cell_annotation = 
-  tar_read(annotation_tbl_light, store = "/vast/scratch/users/shen.m/hta_lung_breast_lighten_annotation_tbl_target") |> 
+  tar_read(annotation_tbl_light, store = "/vast/scratch/users/shen.m/hta_lighten_annotation_tbl_target") |> 
   dplyr::rename(
     blueprint_first_labels_fine = blueprint_first.labels.fine, 
     monaco_first_labels_fine = monaco_first.labels.fine, 
@@ -553,23 +555,23 @@ cell_annotation = cell_annotation |> mutate(
 #                                         compression = "zstd")
 
 empty_droplet = 
-  tar_read(empty_tbl, store = "/vast/scratch/users/shen.m/hta_lung_breast_run_hpcell_target_store") |>
+  tar_read(empty_tbl, store = "/vast/scratch/users/shen.m/hta_all_centers_run_hpcell_target_store") |>
   bind_rows() |>
   dplyr::rename(cell_ = .cell)
 
 alive_cells = 
-  tar_read(alive_tbl, store = "/vast/scratch/users/shen.m/hta_lung_breast_run_hpcell_target_store") |>
+  tar_read(alive_tbl, store = "/vast/scratch/users/shen.m/hta_all_centers_run_hpcell_target_store") |>
   bind_rows() |>
   dplyr::rename(cell_ = .cell) |>
   select(-cell_type_unified_ensemble)
 
 doublet_cells =
-  tar_read(doublet_tbl, store = "/vast/scratch/users/shen.m/hta_lung_breast_run_hpcell_target_store") |>
+  tar_read(doublet_tbl, store = "/vast/scratch/users/shen.m/hta_all_centers_run_hpcell_target_store") |>
   bind_rows() |>
   dplyr::rename(cell_ = .cell)
 
 # metacell = 
-#   tar_read(metacell_tbl, store = "/vast/scratch/users/shen.m/hta_lung_breast_run_hpcell_target_store") |> 
+#   tar_read(metacell_tbl, store = "/vast/scratch/users/shen.m/hta_all_centers_run_hpcell_target_store") |> 
 #   bind_rows() |> 
 #   dplyr::rename(cell_ = cell) |> 
 #   dplyr::rename_with(
@@ -578,7 +580,7 @@ doublet_cells =
 #   )
 
 # Save cell type concensus tbl from HPCell output to disk
-cell_type_concensus_tbl = tar_read(cell_type_concensus_tbl, store = "/vast/scratch/users/shen.m/hta_lung_breast_run_hpcell_target_store") |>  
+cell_type_concensus_tbl = tar_read(cell_type_concensus_tbl, store = "/vast/scratch/users/shen.m/hta_all_centers_run_hpcell_target_store") |>  
   bind_rows() |> 
   dplyr::rename(cell_ = .cell)
 
@@ -634,9 +636,11 @@ explicit_drop <- c("azimuth",
                    "ensemble_joinid",
                    "cell_type_unified",
                    "data_driven_ensemble")
+conflicted::conflicts_prefer(base::intersect)
 drop_cols <- intersect(unique(c(explicit_drop, pattern_drop)), raw_cols)
 
 # Append pseudobulk count — pb_df stays lazy (same DuckDB connection, no copy needed)
+conflicted::conflicts_prefer(dplyr::filter)
 pb_df = cell_metadata_joined2 |> 
   filter(!empty_droplet, alive, scDblFinder.class != "doublet") |>
   count(sample_id, cell_type_unified_ensemble, name = ".aggregated_cells")
@@ -649,18 +653,18 @@ cell_metadata_joined2 |>
   glimpse()
 
 # Write via DuckDB COPY TO — streams directly to parquet without materialising in R RAM
-output_path <- "/vast/projects/cellxgene_curated/hta/metadata_hta_lung_breast.v0.1.0.parquet"
+output_path <- "/vast/projects/cellxgene_curated/hta/metadata_hta.v0.1.0.parquet"
 final_sql <- dbplyr::sql_render(cell_metadata_joined2 |> select(!all_of(drop_cols)))
 DBI::dbExecute(con, sprintf(
   "COPY (%s) TO '%s' (FORMAT PARQUET, COMPRESSION 'zstd')",
   final_sql, output_path
 ))
 
-rm(alive_cells, cell_annotation, empty_droplet, cell_type_concensus_tbl, cell_type_concensus_tbl, doublet_cells)
+rm(alive_cells, cell_annotation, empty_droplet, cell_type_concensus_tbl, doublet_cells)
 gc()
 
 # # Cellchat output
-# ligand_receptor_tbl = tar_read(ligand_receptor_tbl, store = "/vast/scratch/users/shen.m/hta_lung_breast_run_hpcell_target_store") |> bind_rows()
+# ligand_receptor_tbl = tar_read(ligand_receptor_tbl, store = "/vast/scratch/users/shen.m/hta_all_centers_run_hpcell_target_store") |> bind_rows()
 
 # tar_meta(store = my_store, starts_with("sct")) |> pull(name) |> _[[1]] |>
 #   tar_read_raw(store = my_store)
@@ -669,7 +673,7 @@ gc()
 # Save counts, cpm, rank, sct
 library(targets)
 library(tidyverse)
-store_file_cellNexus = "/vast/scratch/users/shen.m/htan/hta/targets_run_normalised_counts_v0.2.0"
+store_file_cellNexus = "/vast/scratch/users/shen.m/htan/hta/targets_run_normalised_counts_v0.3.0"
 
 tar_script({
   library(dplyr)
@@ -979,11 +983,11 @@ tar_script({
   list(
     
     # The input DO NOT DELETE
-    tar_target(my_store, "/vast/scratch/users/shen.m/hta_lung_breast_run_hpcell_target_store", deployment = "main"), # MODIFY HERE: HPCell targets store to read SCEs from
-    tar_target(cache_directory, "/vast/scratch/users/shen.m/hta_2025/0.2.0", deployment = "main"), # MODIFY HERE: output cache directory for saved anndata files
+    tar_target(my_store, "/vast/scratch/users/shen.m/hta_all_centers_run_hpcell_target_store", deployment = "main"), # MODIFY HERE: HPCell targets store to read SCEs from
+    tar_target(cache_directory, "/vast/scratch/users/shen.m/hta_2025/0.3.0", deployment = "main"), # MODIFY HERE: output cache directory for saved anndata files
     tar_target(
       cell_metadata,
-      "/vast/projects/cellxgene_curated/hta/metadata_hta_lung_breast.v0.1.0.parquet", # MODIFY HERE: final metadata parquet (should match the COPY TO output above)
+      "/vast/projects/cellxgene_curated/hta/metadata_hta.v0.1.0.parquet", # MODIFY HERE: final metadata parquet (should match the COPY TO output above)
       packages = c( "arrow","dplyr","duckdb")
       
     ),
@@ -1126,36 +1130,37 @@ tar_progress_branches(store = store_file_cellNexus) |> mutate(pending = branches
 library(cellNexus)
 library(tidyr)
 library(ggplot2)
-x = get_metadata(cloud_metadata = NULL, local_metadata = "/vast/projects/cellxgene_curated/hta/metadata_hta_lung_breast.v0.1.0.parquet")
+x = get_metadata(cloud_metadata = NULL, local_metadata = "/vast/projects/cellxgene_curated/hta/metadata_hta.v0.1.0.parquet")
 x |> dplyr::count()
-x |> count(empty_droplet, alive, scDblFinder.class)
 
-df_long <- x |>
-  select(tissue, empty_droplet, alive, scDblFinder.class) |>
-  mutate(tissue_groups = case_when(
-    tissue |> str_detect("lung") ~ "lung",
-    tissue |> str_detect("breast") ~ "breast",
-    TRUE ~ NA
-  )) |>
-  pivot_longer(
-    cols = c(empty_droplet, alive, scDblFinder.class),
-    names_to = "annotation",
-    values_to = "value"
-  ) |>
-  filter(!is.na(value))   # drops alive/scDblFinder.class rows where empty_droplet == TRUE
-
-
-# Visualise all QC
-all_summary <- df_long |>
-  count(annotation, value, name = "n") |>
-  group_by(annotation) |>
-  mutate(pct = n / sum(n) * 100) |>
-  ungroup() |>
-  filter(
-      (annotation == "empty_droplet" & value == "true")  |
-        (annotation == "alive" & value == "false")          |
-        (annotation == "scDblFinder.class" & value == "doublet")
+qc_summary <- x |>
+  mutate(
+    category = case_when(
+      empty_droplet ~ "Empty droplet",
+      !empty_droplet & !alive ~ "Dead cells",
+      !empty_droplet & scDblFinder.class == "doublet" ~ "Doublet",
+      TRUE ~ "Good cells"
     )
+  ) |>
+  count(category) |>
+  collect() |>
+  mutate(pct = n / sum(n) * 100)
+
+# Plot
+ggplot(qc_summary, aes(x = reorder(category, -pct), y = pct, fill = category)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = sprintf("%.2f%%", pct)), vjust = -0.4, size = 3.5) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(
+    title = "QC breakdown of HTA",
+    x = NULL,
+    y = "% of total droplets"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 30, hjust = 1)
+  )
 
 
 # # Visualise per tissue QC
@@ -1166,22 +1171,90 @@ all_summary <- df_long |>
 #       (annotation == "scDblFinder.class" & value == "doublet")
 #   )
 
-
-ggplot(all_summary, aes(x = annotation, y = pct, fill = value)) +
-  geom_col(position = "dodge") +
-  labs(x = NULL, y = "% of cells", fill = NULL) +
-  theme_bw() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
-
 sce = x |> keep_quality_cells() |>  # FOR TESTING PURPOSE ONLY
-  filter(file_id_cellNexus_single_cell %in% c("HTA1_254_571101.h5ad",
-                                              "HTA1_231_6758320___channel2.h5ad")) |>
+  filter(sample_id %in% c("HTA1_254_571101",
+                          "HTA1_141_119201")) |>
   get_single_cell_experiment(assays = c("counts"), cache_directory = "/vast/scratch/users/shen.m/", repository = NULL)
 
 
-pb = x |> keep_quality_cells() |> 
-  # FOR TESTING PURPOSE ONLY
-  filter(file_id_cellNexus_single_cell %in% c("HTA1_254_571101.h5ad",
-                                              "HTA1_231_6758320___channel2.h5ad")) |>
-  get_pseudobulk(cache_directory = "/vast/scratch/users/shen.m/htan/", repository = NULL)
+# pb = x |> keep_quality_cells() |> 
+#   # FOR TESTING PURPOSE ONLY
+#   filter(file_id_cellNexus_single_cell %in% c("HTA1_254_571101.h5ad",
+#                                               "HTA1_231_6758320___channel2.h5ad")) |>
+#   get_pseudobulk(cache_directory = "/vast/scratch/users/shen.m/htan/", repository = NULL)
+
+
+# Tissue groups
+
+get_tissue_grouped <- function() {
+  list(
+    "breast nos" = "Breast",
+    "colon nos" = "Colorectal",
+    "lung nos" = "Lung",
+    "abdomen nos" = "Other and Ill-defined Sites",
+    "upper-outer quadrant of breast" = "Breast",
+    "blood" = "Bone Marrow",
+    "not reported" = "Not Reported",
+    "adrenal gland nos" = "Adrenal Gland",
+    "ovary" = "Ovary",
+    "pancreas nos" = "Pancreas",
+    "bone marrow" = "Bone Marrow",
+    "skin of trunk, vulva nos, skin of upper limb and shoulder" = "Skin",
+    "upper-inner quadrant of breast" = "Breast",
+    "lower lobe lung" = "Lung",
+    "brain nos" = "Brain",
+    "lymph node nos" = "Lymph Nodes",
+    "upper lobe lung" = "Lung",
+    "unknown" = "Not Reported",
+    "liver" = "Liver",
+    "cervix uteri" = "Cervix",
+    "skin of trunk, unknown, skin of upper limb and shoulder" = "Skin",
+    "endometrium" = "Uterus",
+    "skin of upper limb and shoulder, skin of trunk, lymph nodes of axilla or arm" = "Skin",
+    "lower-outer quadrant of breast" = "Breast",
+    "overlapping lesion of breast" = "Breast",
+    "mediastinum nos" = "Other and Ill-defined Sites",
+    "lower-inner quadrant of breast" = "Breast",
+    "tonsil nos" = "Head and Neck",
+    "descending colon" = "Colorectal",
+    "kidney nos" = "Kidney",
+    "ascending colon" = "Colorectal",
+    "middle lobe lung" = "Lung",
+    "unknown primary site" = "Not Reported",
+    "rectum nos" = "Colorectal",
+    "skin of upper limb and shoulder" = "Skin",
+    "base of tongue nos" = "Head and Neck",
+    "retroperitoneum" = "Other and Ill-defined Sites",
+    "lower limb nos" = "Other and Ill-defined Sites",
+    "long bones of lower limb and associated joints" = "Bone",
+    "connective subcutaneous and other soft tissues of thorax" = "Soft Tissue",
+    "floor of mouth nos" = "Head and Neck",
+    "upper limb nos" = "Other and Ill-defined Sites",
+    "rectosigmoid junction" = "Colorectal",
+    "paraspinal" = "Other and Ill-defined Sites",
+    "cheek mucosa" = "Head and Neck",
+    "skin of trunk" = "Skin",
+    "skin of lower limb and hip" = "Skin",
+    "long bones of upper limb scapula and associated joints" = "Bone",
+    "anterior 2/3 of tongue nos" = "Head and Neck",
+    "connective subcutaneous and other soft tissues of lower limb and hip" = "Soft Tissue",
+    "transverse colon" = "Colorectal",
+    "retromolar area" = "Head and Neck",
+    "connective subcutaneous and other soft tissues of trunk nos" = "Soft Tissue",
+    "larynx nos" = "Head and Neck",
+    "sigmoid colon" = "Colorectal",
+    "vulva nos" = "Other and Ill-defined Sites",
+    "connective subcutaneous and other soft tissues nos" = "Soft Tissue",
+    "connective subcutaneous and other soft tissues of abdomen" = "Soft Tissue",
+    "cerebellum nos" = "Brain",
+    "parietal lobe" = "Brain",
+    "temporal lobe" = "Brain"
+  ) |>
+    enframe(name = "tissue", value = "tissue_groups") |>
+    unnest(tissue_groups) |>
+    distinct()
+}
+
+x |> left_join(get_tissue_lookup(), copy=T) |> count(tissue_groups) |> arrange(desc(n))
+
 

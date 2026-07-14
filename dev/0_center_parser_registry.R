@@ -26,17 +26,18 @@
 #   HDF5 file with no per-cell sample assignment available in the metadata.
 #   Cannot be demultiplexed here; flagged as pool — needs separate handling.
 #
-# CENTER SUMMARY (Lung + Breast as of 2025-10)
-# --------------------------------------------
-#  Center      | Atlas ID | Organ(s)      | L3 format        | L4 format        | Strategy
-#  ------------|----------|---------------|------------------|------------------|--------------------
-#  HTAN HTAPP  | HTA1     | Lung, Breast  | MTX triplet      | TSV (cell list)  | L3_MTX + L4_TSV
-#  HTAN BU     | HTA3     | Lung          | Dense CSV        | CSV (cell list)  | L3_CSV + L4_CSV
-#  HTAN MSK    | HTA8     | Lung          | MTX / CSV        | h5ad (counts)    | L4_H5AD  ← preferred
-#  HTAN DFCI   | HTA5     | Breast        | 10X HDF5 (pool)  | none             | POOLED — flag
-#  HTAN Duke   | HTA6     | Breast        | MTX triplet      | RDS (all smpls)  | L3_MTX + L4_RDS
-#  HTAN OHSU   | HTA9     | Breast        | 10X HDF5 (1:1)   | none             | L3_10X_HDF5
-#  HTAN WUSTL  | HTA12    | Breast        | MTX triplet      | RDS (per sample) | L3_MTX + L4_RDS
+# CENTER SUMMARY (Lung + Breast + Paediatric as of 2025-10)
+# ----------------------------------------------------------
+#  Center      | Atlas ID | Organ(s)             | L3 format        | L4 format           | Strategy
+#  ------------|----------|----------------------|------------------|---------------------|-----------------------------
+#  HTAN HTAPP  | HTA1     | Lung, Breast         | MTX triplet      | TSV (cell list)     | L3_MTX + L4_TSV
+#  HTAN BU     | HTA3     | Lung                 | Dense CSV        | CSV (cell list)     | L3_CSV + L4_CSV
+#  HTAN CHOP   | HTA4     | NBL, ped-glioma      | MTX triplet      | RDS (per smp, NBL)  | L4_RDS + L3_MTX_fallback
+#  HTAN MSK    | HTA8     | Lung                 | MTX / CSV        | h5ad (counts)       | L4_H5AD  ← preferred
+#  HTAN DFCI   | HTA5     | Breast               | 10X HDF5 (pool)  | none                | POOLED — flag
+#  HTAN Duke   | HTA6     | Breast               | MTX triplet      | RDS (all smpls)     | L3_MTX + L4_RDS
+#  HTAN OHSU   | HTA9     | Breast               | 10X HDF5 (1:1)   | none                | L3_10X_HDF5
+#  HTAN WUSTL  | HTA12    | Breast               | MTX triplet      | RDS (per sample)    | L3_MTX + L4_RDS
 #
 # WHY L4_H5AD FOR MSK?
 # ---------------------
@@ -169,6 +170,19 @@ filter_empty_droplets <- function(sce, workers = 5) {
   sce[, which(is.cell)]
 }
 
+#' Strip numeric version suffixes (.1, .2, …) from a gene-name vector.
+#' Suffixes are removed ONLY when the result remains unique across all genes.
+#' If stripping would introduce duplicates (i.e. the suffixes are meaningful
+#' rather than CellRanger disambiguation artefacts), the original vector is
+#' returned unchanged with a warning.
+strip_gene_version_suffix <- function(genes) {
+  stripped <- sub("\\.[0-9]+$", "", genes)
+  if (!anyDuplicated(stripped)) return(stripped)
+  warning("strip_gene_version_suffix: stripping would produce ",
+          sum(duplicated(stripped)), " duplicate gene names — keeping originals.")
+  genes
+}
+
 #' Save a single SCE as a gzip-compressed h5ad
 save_h5ad <- function(sample_id, sce, save_directory) {
   if (!dir.exists(save_directory)) dir.create(save_directory, recursive = TRUE)
@@ -178,6 +192,32 @@ save_h5ad <- function(sample_id, sce, save_directory) {
   out
 }
 
+#' Resolve a file path case-insensitively on case-sensitive filesystems (HPC).
+#' Synapse sometimes downloads files with a different case than the metadata
+#' records (e.g. metadata says "4563as25.csv", disk has "4563AS25.csv").
+#' Returns the path unchanged if it already exists; otherwise scans the parent
+#' directory for a case-insensitive basename match and returns the first hit.
+#' Stops with an informative message if no match is found at all.
+resolve_csv_path <- function(path) {
+  if (file.exists(path)) return(path)
+  dir  <- dirname(path)
+  base <- basename(path)
+  # Case-insensitive match by comparing lowercased basenames directly —
+  # avoids regex metacharacter escaping issues entirely.
+  all_files <- list.files(dir, full.names = TRUE)
+  hits <- all_files[tolower(basename(all_files)) == tolower(base)]
+  if (length(hits) == 1L) {
+    message("resolve_csv_path: '", base, "' not found; using '",
+            basename(hits), "' (case-insensitive match).")
+    return(hits)
+  }
+  if (length(hits) > 1L) {
+    warning("resolve_csv_path: multiple case-insensitive matches for '", base,
+            "' in ", dir, "; using first: ", basename(hits[1]))
+    return(hits[1])
+  }
+  stop("resolve_csv_path: file not found and no case-insensitive match: ", path)
+}
 
 # -----------------------------------------------------------------------------
 # Parser: HTAN HTAPP  (HTA1)
@@ -189,11 +229,66 @@ save_h5ad <- function(sample_id, sce, save_directory) {
 #     One L4 TSV covers multiple biospecimens (batch file).
 #     The NAME column encodes the barcode as output by CellRanger.
 # -----------------------------------------------------------------------------
+
+# Reads the mtx header to get expected dimensions, without loading the whole matrix
+get_mtx_dims <- function(mtx_path) {
+  con <- if (grepl("\\.gz$", mtx_path)) gzfile(mtx_path, "r") else file(mtx_path, "r")
+  on.exit(close(con))
+  line <- readLines(con, n = 1)
+  while (startsWith(line, "%")) line <- readLines(con, n = 1)
+  dims <- as.integer(strsplit(trimws(line), "\\s+")[[1]])
+  list(n_features = dims[1], n_barcodes = dims[2])
+}
+
+# Wraps ReadMtx: tries as-is, and on a row/col count mismatch, measures the
+# actual line-count offset per file and retries with the correct skip values
+read_mtx_safe <- function(mtx_path, genes_path, barcodes_path) {
+  tryCatch({
+    Seurat::ReadMtx(mtx = mtx_path, cells = barcodes_path,
+                    features = genes_path, feature.column = 1)
+  }, error = function(e) {
+    msg <- conditionMessage(e)
+    if (!grepl("but found", msg)) stop(e)  # not the mismatch we know how to fix
+    
+    dims <- get_mtx_dims(mtx_path)
+    n_genes    <- length(readLines(genes_path))
+    n_barcodes <- length(readLines(barcodes_path))
+    
+    skip.feature <- n_genes    - dims$n_features
+    skip.cell    <- n_barcodes - dims$n_barcodes
+    
+    if (skip.feature < 0 || skip.cell < 0) {
+      stop(sprintf(
+        "Unresolvable mismatch for %s: mtx expects %d features/%d barcodes, found %d/%d lines (negative skip)",
+        basename(mtx_path), dims$n_features, dims$n_barcodes, n_genes, n_barcodes
+      ))
+    }
+    
+    message(sprintf(
+      "%s: retrying with skip.feature=%d, skip.cell=%d (original error: %s)",
+      basename(mtx_path), skip.feature, skip.cell, msg
+    ))
+    
+    Seurat::ReadMtx(mtx = mtx_path, cells = barcodes_path, features = genes_path,
+                    feature.column = 1, skip.cell = skip.cell, skip.feature = skip.feature)
+  })
+}
+
 parse_HTAPP <- function(sample_id, mtx_path, genes_path, barcodes_path, cell_index_df) {
-  counts   <- Seurat::ReadMtx(mtx = mtx_path, cells = barcodes_path,
-                              features = genes_path, feature.column = 1)
-  genes    <- read.delim(genes_path,    header = FALSE)$V1
-  barcodes <- read.delim(barcodes_path, header = FALSE)$V1
+  counts <- read_mtx_safe(mtx_path, genes_path, barcodes_path)
+  
+  # Read genes/barcodes with the same skip logic as whatever ReadMtx ended up using,
+  # by re-deriving the offsets the same way (cheap: just re-check line counts)
+  dims <- get_mtx_dims(mtx_path)
+  n_genes_lines    <- length(readLines(genes_path))
+  n_barcodes_lines <- length(readLines(barcodes_path))
+  skip.feature <- max(n_genes_lines    - dims$n_features, 0)
+  skip.cell    <- max(n_barcodes_lines - dims$n_barcodes, 0)
+  
+  genes    <- read.delim(genes_path,    header = FALSE, skip = skip.feature)$V1
+  barcodes <- read.delim(barcodes_path, header = FALSE, skip = skip.cell)$V1
+  
+  stopifnot(length(genes) == nrow(counts), length(barcodes) == ncol(counts))
   
   sce <- SingleCellExperiment(
     assays  = list(counts = counts),
@@ -202,15 +297,13 @@ parse_HTAPP <- function(sample_id, mtx_path, genes_path, barcodes_path, cell_ind
                          row.names = barcodes)
   )
   
-  sce     <- filter_empty_droplets(sce)
+  sce <- filter_empty_droplets(sce)
   
   cd_base <- colData(sce) |> as.data.frame() |> rownames_to_column("old_cell_id")
   
   if (is.null(cell_index_df)) {
-    # No L4 file for this sample: keep all barcodes, assign sequential indices
     cd <- cd_base |> mutate(cell_id = seq_len(n()))
   } else {
-    # Intersect with L4 filtered barcodes and get global cell index
     cd <- cd_base |>
       inner_join(cell_index_df, by = c("old_cell_id" = "NAME", "sample_id")) |>
       dplyr::rename(cell_id = cell_index)
@@ -493,7 +586,7 @@ parse_Duke_seurat <- function(l4_rds_path, cell_index_df) {
       
       cid <- cell_index_df |>
         dplyr::filter(sample_id == sid) |>
-        dplyr::select(NAME, cell_index)
+        dplyr::select(NAME, cell_index, sample_id)
       
       cd <- colData(sce) |> as.data.frame() |> tibble::rownames_to_column("old_cell_id") |>
         dplyr::inner_join(cid, by = c("old_cell_id" = "NAME", "sample_id")) |>
@@ -568,6 +661,292 @@ build_dfci_cell_index <- function(metadata) {
   })
 }
 
+# -----------------------------------------------------------------------------
+# Parser: HTAN CHOP  (HTA4)
+# Strategy: L4 per-sample Seurat RDS when available (NBL cohort);
+#           L3 MTX triplet fallback for samples with no L4 (ped-glioma cohort).
+#
+# L4: seurat_objects_count_based/seurat_object_NB_7767_*.rds
+#     One .rds per biospecimen (single Biospecimen ID in metadata).
+#     These are the raw-count Seurat objects submitted by CHOP for the NBL
+#     cohort.  The other L4 RDS files (Global_seurat_object.rds, merged
+#     patient/ped-glioma objects) are integration/QC artefacts — ignored here.
+# L3: Standard CellRanger triplet per sample directory:
+#       barcodes.tsv.gz / features.tsv.gz / matrix.mtx.gz
+#     Files use plain basenames (no per-sample prefix unlike Duke/HTAPP).
+#     Rows with Biospecimen == "0 Biospecimens" are backup artefacts — excluded.
+#
+# Cell index:
+#   L4 samples : sorted barcodes from Seurat object → deterministic cell_index
+#   L3 samples : sequential barcodes from barcodes.tsv.gz
+# -----------------------------------------------------------------------------
+
+#' Build per-sample CHOP cell index from L4 per-sample Seurat RDS.
+#' Called once per sample (patterned target).
+#' Returns tibble: sample_id | NAME (barcode) | cell_index
+build_chop_l4_cell_index <- function(metadata) {
+  purrr::pmap_dfr(metadata, function(sample_id, l4_rds_path) {
+    seurat_obj <- readRDS(l4_rds_path)
+    seurat_obj <- UpdateSeuratObject(seurat_obj)
+    barcodes   <- sort(Seurat::Cells(seurat_obj))
+    tibble::tibble(
+      sample_id  = sample_id,
+      NAME       = barcodes,
+      cell_index = seq_along(barcodes)
+    )
+  })
+}
+
+#' Build CHOP cell index for L3-only samples (no L4 RDS) from barcodes files.
+#' Returns tibble: sample_id | NAME (barcode) | cell_index
+build_chop_l3_cell_index <- function(metadata) {
+  purrr::pmap_dfr(metadata, function(sample_id, barcodes_path) {
+    barcodes <- read.delim(barcodes_path, header = FALSE)$V1
+    tibble::tibble(
+      sample_id  = sample_id,
+      NAME       = barcodes,
+      cell_index = seq_along(barcodes)
+    )
+  })
+}
+
+#' Parse a single CHOP sample from its L4 per-sample Seurat RDS.
+#' Extracts RNA assay counts, assigns sample_id, maps barcodes to the
+#' deterministic indices supplied in cell_index_df.
+#' No emptyDrops filter — L4 Seurat objects are already QC-filtered.
+parse_CHOP_seurat <- function(sample_id, l4_rds_path, cell_index_df) {
+  seurat_obj <- readRDS(l4_rds_path)
+  seurat_obj <- UpdateSeuratObject(seurat_obj)
+  counts     <- Seurat::GetAssayData(seurat_obj, assay = "RNA", layer = "counts")
+  
+  sce <- SingleCellExperiment(
+    assays  = list(counts = counts),
+    rowData = data.frame(gene_id = rownames(counts), row.names = rownames(counts)),
+    colData = data.frame(barcode   = colnames(counts),
+                         sample_id = sample_id,
+                         row.names = colnames(counts))
+  )
+  
+  cd <- colData(sce) |> as.data.frame() |> tibble::rownames_to_column("old_cell_id") |>
+    dplyr::inner_join(cell_index_df, by = c("old_cell_id" = "NAME")) |>
+    dplyr::rename(cell_id = cell_index)
+  
+  if (nrow(cd) == 0) return(NULL)
+  sce_sub <- sce[, cd$old_cell_id]
+  stopifnot(ncol(sce_sub) == nrow(cd))
+  finalise_sce(sce_sub, setNames(cd$cell_id, cd$old_cell_id))
+}
+
+#' Parse a single CHOP L3-only sample from a CellRanger MTX triplet.
+#' Applies emptyDrops filtering before joining to cell_index_df.
+parse_CHOP <- function(sample_id, mtx_path, genes_path, barcodes_path,
+                       cell_index_df) {
+  counts   <- Seurat::ReadMtx(mtx = mtx_path, cells = barcodes_path,
+                              features = genes_path, feature.column = 1)
+  genes    <- read.delim(genes_path,    header = FALSE)$V1
+  barcodes <- read.delim(barcodes_path, header = FALSE)$V1
+  
+  genes          <- strip_gene_version_suffix(genes)
+  rownames(counts) <- genes
+  
+  sce <- SingleCellExperiment(
+    assays  = list(counts = counts),
+    rowData = data.frame(gene_id = genes, row.names = genes),
+    colData = data.frame(barcode = barcodes, sample_id = sample_id,
+                         row.names = barcodes)
+  )
+  
+  sce <- filter_empty_droplets(sce)
+  
+  cd <- colData(sce) |> as.data.frame() |> tibble::rownames_to_column("old_cell_id") |>
+    dplyr::inner_join(cell_index_df, by = c("old_cell_id" = "NAME", "sample_id")) |>
+    dplyr::rename(cell_id = cell_index)
+  
+  if (nrow(cd) == 0) return(NULL)
+  sce_sub <- sce[, cd$old_cell_id]
+  stopifnot(ncol(sce_sub) == nrow(cd))
+  finalise_sce(sce_sub, setNames(cd$cell_id, cd$old_cell_id))
+}
+
+# -----------------------------------------------------------------------------
+# Parser: HTAN Stanford  (HTA10)
+# Strategy: L3 MTX triplet only (no L4 available)
+#
+# Files: {SamplePrefix}_barcodes.tsv.gz / _features.tsv.gz / _matrix.mtx.gz
+# Some biospecimens have both a primary run and an "-R0" re-run that share
+# the same Biospecimen ID.  The "-R0" files are excluded at the metadata-prep
+# step (filter Filename_basename containing "R0") so each biospecimen maps
+# to exactly one MTX triplet.
+# -----------------------------------------------------------------------------
+
+#' Build cell index for Stanford samples from barcodes files.
+#' Returns tibble: sample_id | NAME (barcode) | cell_index
+build_stanford_cell_index <- function(metadata) {
+  purrr::pmap_dfr(metadata, function(sample_id, barcodes_path) {
+    barcodes <- read.delim(barcodes_path, header = FALSE)$V1
+    tibble::tibble(
+      sample_id  = sample_id,
+      NAME       = barcodes,
+      cell_index = seq_along(barcodes)
+    )
+  })
+}
+
+#' Parse a single Stanford sample from a CellRanger MTX triplet.
+#' Applies emptyDrops filtering; no L4 cell filter is available.
+parse_stanford <- function(sample_id, mtx_path, genes_path, barcodes_path,
+                           cell_index_df) {
+  counts   <- Seurat::ReadMtx(mtx = mtx_path, cells = barcodes_path,
+                              features = genes_path, feature.column = 1)
+  genes    <- read.delim(genes_path,    header = FALSE)$V1
+  barcodes <- read.delim(barcodes_path, header = FALSE)$V1
+  
+  sce <- SingleCellExperiment(
+    assays  = list(counts = counts),
+    rowData = data.frame(gene_id = genes, row.names = genes),
+    colData = data.frame(barcode = barcodes, sample_id = sample_id,
+                         row.names = barcodes)
+  )
+  
+  sce <- filter_empty_droplets(sce)
+  
+  cd <- colData(sce) |> as.data.frame() |> tibble::rownames_to_column("old_cell_id") |>
+    dplyr::inner_join(cell_index_df, by = c("old_cell_id" = "NAME", "sample_id")) |>
+    dplyr::rename(cell_id = cell_index)
+  
+  if (nrow(cd) == 0) return(NULL)
+  sce_sub <- sce[, cd$old_cell_id]
+  stopifnot(ncol(sce_sub) == nrow(cd))
+  finalise_sce(sce_sub, setNames(cd$cell_id, cd$old_cell_id))
+}
+
+# -----------------------------------------------------------------------------
+# Parser: HTAN Vanderbilt  (HTA11)
+# Strategy: L3 dense CSV, cell-type-partitioned or multi-batch cbind
+#
+# Two CSV sub-types share the same parser:
+#   YX series:  {batch}-YX-{N}_epi.csv + {batch}-YX-{N}_immune.csv
+#               Always 2 files per biospecimen (epithelial + immune compartments).
+#               → cbind the two cell partitions.
+#   as series:  {batch}as{N}.csv — 1–4 CSVs from different study batches
+#               mapping to the same Biospecimen ID (different cells per batch).
+#               → cbind all files after gene-set intersection.
+#
+# Format: gene × cell dense CSV (rows = gene symbols, cols = cell IDs).
+# No L4 available; all called cells are retained (no emptyDrops needed).
+# Barcode collisions across files are resolved with a ___f{i} suffix.
+#
+# MTX sub-group (P9142 only, 2 biospecimens): parsed with parse_stanford().
+# Lau MTX group (~13 biospecimens): POOLED lanes — flag like DFCI.
+# -----------------------------------------------------------------------------
+
+#' Build cell index for Vanderbilt CSV samples.
+#' metadata must have columns sample_id and csv_paths (a list-column of sorted paths).
+#' Reads only column headers to get cell IDs without loading full matrices.
+#' Returns tibble: sample_id | NAME (cell ID) | cell_index
+build_vanderbilt_csv_cell_index <- function(metadata) {
+  purrr::pmap_dfr(metadata, function(sample_id, csv_paths) {
+    # cell_ids_per_file <- lapply(csv_paths, function(p) {
+    #   rownames(read.csv(resolve_csv_path(p), row.names = 1, nrows = 0, check.names = FALSE))
+    # })
+    
+    cell_ids_per_file <- lapply(csv_paths, function(p) {
+      # Format: cell × gene (rows = cells, cols = genes).
+      # Cell IDs are in the first column of each data row (not the header).
+      # Read lines directly and extract the first comma-delimited field,
+      # skipping the header row. Avoids loading the full count matrix.
+      con <- file(resolve_csv_path(p), open = "r")
+      on.exit(close(con))
+      lines <- readLines(con)
+      vapply(lines[-1L], function(l) {
+        end <- regexpr(",", l, fixed = TRUE)
+        if (end == -1L) l else substr(l, 1L, end - 1L)
+      }, character(1L), USE.NAMES = FALSE)
+    })
+    
+    all_ids <- unlist(cell_ids_per_file)
+    n_dup   <- sum(duplicated(all_ids))
+    if (n_dup > 0) {
+      message("build_vanderbilt_csv_cell_index [", sample_id, "]: dropping ",
+              n_dup, " duplicated cell ID(s) (keeping first occurrence).")
+      all_ids <- all_ids[!duplicated(all_ids)]
+    }
+    tibble::tibble(
+      sample_id  = sample_id,
+      NAME       = all_ids,
+      cell_index = seq_along(all_ids)
+    )
+  })
+}
+
+#' Parse a single Vanderbilt sample from 1–N dense CSVs.
+#' Handles single CSVs, epi+immune pairs, and multi-batch as-series equally.
+#' CSVs are assumed gene × cell (rows = gene symbols, cols = cell IDs).
+#' If files are transposed (cell × gene), add t() in the read step.
+parse_vanderbilt_csv <- function(sample_id, csv_paths, cell_index_df) {
+  # mats <- lapply(csv_paths, function(p) {
+  #   as.matrix(t(read.csv(resolve_csv_path(p), row.names = 1, check.names = FALSE)))
+  # })
+  
+  mats <- lapply(csv_paths, function(p) {
+    # Format: cell × gene (rows = cells, cols = genes).
+    # Read without row.names = 1 to avoid errors on duplicate gene names.
+    # First column = cell IDs; remaining columns = gene expression values.
+    # Transpose to gene × cell after extracting cell IDs and gene names.
+    df    <- read.csv(resolve_csv_path(p), check.names = FALSE, row.names = NULL)
+    cells <- df[[1L]]
+    genes <- colnames(df)[-1L]
+    m     <- t(as.matrix(df[, -1L, drop = FALSE]))  # → gene × cell
+    colnames(m) <- cells
+    # Deduplicate gene rows (keep first occurrence of each symbol)
+    keep_genes <- !duplicated(genes)
+    if (!all(keep_genes))
+      message("parse_vanderbilt_csv [", sample_id, "]: dropping ",
+              sum(!keep_genes), " duplicate gene(s) in ", basename(p), ".")
+    m           <- m[keep_genes, , drop = FALSE]
+    rownames(m) <- genes[keep_genes]
+    m
+  })
+  
+  # Intersect gene sets (should be identical within a series, but be defensive)
+  common_genes <- Reduce(intersect, lapply(mats, rownames))
+  if (length(common_genes) == 0)
+    stop("parse_vanderbilt_csv: no common genes across CSV files for ", sample_id)
+  if (length(common_genes) < nrow(mats[[1]]))
+    warning("parse_vanderbilt_csv [", sample_id, "]: restricting to ",
+            length(common_genes), " common genes (from ", nrow(mats[[1]]), ").")
+  mats <- lapply(mats, function(m) m[common_genes, , drop = FALSE])
+  
+  counts <- do.call(cbind, mats)
+  
+  # Drop duplicate cell IDs (keep first occurrence, matching cell index builder)
+  dup_cells <- duplicated(colnames(counts))
+  if (any(dup_cells)) {
+    message("parse_vanderbilt_csv [", sample_id, "]: dropping ",
+            sum(dup_cells), " duplicated cell ID(s) (keeping first occurrence).")
+    counts <- counts[, !dup_cells, drop = FALSE]
+  }
+  
+  sce <- SingleCellExperiment(
+    assays  = list(counts = counts),
+    rowData = data.frame(gene_id = common_genes, row.names = common_genes),
+    colData = data.frame(sample_id = rep(sample_id, ncol(counts)), row.names = colnames(counts))
+  )
+  
+  cd <- colData(sce) |> as.data.frame() |> tibble::rownames_to_column("old_cell_id") |>
+    dplyr::inner_join(cell_index_df, by = c("old_cell_id" = "NAME", "sample_id")) |>
+    dplyr::rename(cell_id = cell_index)
+  
+  if (nrow(cd) == 0) return(NULL)
+  sce_sub <- sce[, cd$old_cell_id]
+  stopifnot(ncol(sce_sub) == nrow(cd))
+  finalise_sce(sce_sub, setNames(cd$cell_id, cd$old_cell_id))
+}
+
+#' Parse a single Vanderbilt MTX sample (P9142 sub-group).
+#' Delegates to parse_stanford — same CellRanger triplet format, same
+#' emptyDrops filter, no L4. Named separately for registry clarity.
+parse_vanderbilt <- function(...) parse_stanford(...)
 
 # -----------------------------------------------------------------------------
 # Center registry
@@ -693,6 +1072,63 @@ CENTRE_REGISTRY <- list(
       "No per-cell sample assignment available in HTAN metadata.",
       "Reads return pool_id (file basename) not a per-sample ID.",
       "Resolve with HTO demultiplexing or SNP-based tools (vireo/demuxlet)."
+    )
+  ),
+  
+  "HTAN CHOP" = list(
+    strategy      = "L4_RDS_per_sample (NBL) + L3_MTX_fallback (ped-glioma)",
+    l3_file_types = list(
+      mtx_path      = "^matrix\\.mtx\\.gz$",
+      genes_path    = "^features\\.tsv\\.gz$",
+      barcodes_path = "^barcodes\\.tsv\\.gz$"
+    ),
+    l4_file_types = list(l4_rds_path = "seurat_objects_count_based/.*\\.rds$"),
+    l4_level      = "Level 4",
+    parse_fn      = parse_CHOP,
+    channel_split = FALSE,
+    note          = paste(
+      "L4 per-sample RDS only from seurat_objects_count_based/ (NBL cohort).",
+      "Other L4 RDS files (Global_seurat_object, merged patient/ped-glioma) are",
+      "integration artefacts — ignored. L3 MTX triplet uses plain basenames",
+      "(barcodes.tsv.gz / features.tsv.gz / matrix.mtx.gz); match by exact",
+      "basename, not prefix. Rows with Biospecimen == '0 Biospecimens' are",
+      "_bak duplicates — filter before building metadata."
+    )
+  ),
+  
+  "HTAN Stanford" = list(
+    strategy      = "L3_MTX (no L4 available)",
+    l3_file_types = list(
+      mtx_path      = "_matrix\\.mtx\\.gz$",
+      genes_path    = "_features\\.tsv\\.gz$",
+      barcodes_path = "_barcodes\\.tsv\\.gz$"
+    ),
+    l4_file_types = NULL,
+    l4_level      = NULL,
+    parse_fn      = parse_stanford,
+    channel_split = FALSE,
+    note          = paste(
+      "Colon NOS. L3 MTX triplet only; no L4 available.",
+      "Some biospecimens have a duplicate '-R0' re-run — exclude",
+      "Filename_basename values containing 'R0' before building metadata",
+      "to ensure each biospecimen maps to exactly one MTX triplet."
+    )
+  ),
+  
+  "HTAN Vanderbilt" = list(
+    strategy      = "L3_CSV_partitioned (epi+immune cbind, or multi-batch cbind)",
+    l3_file_types = list(csv_path = "\\.csv$"),
+    l4_file_types = NULL,
+    l4_level      = NULL,
+    parse_fn      = parse_vanderbilt_csv,
+    channel_split = FALSE,
+    note          = paste(
+      "Colon/Not Reported. Two CSV sub-types:",
+      "YX series: always 2 files per biospecimen (_epi + _immune) — cbind cell compartments.",
+      "as series: 1–4 CSVs from different study batches per biospecimen — cbind all.",
+      "P9142 MTX (2 biospecimens, single IDs) parsed with parse_stanford().",
+      "Lau MTX group (~13 biospecimens, comma-separated IDs) is POOLED — flag like DFCI.",
+      "CSVs are gene × cell dense matrices; gene names are symbols → convert_gene_to_ensembl()."
     )
   )
 )

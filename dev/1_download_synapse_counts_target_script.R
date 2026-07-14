@@ -89,29 +89,69 @@ tar_script({
     ) 
   )
   
-  # Read file and get id
+  # Read file and get id.
+  # Returns a data frame with columns: Synapse.Id, Atlas.Name, rename_prefix.
+  # rename_prefix is non-empty only for CHOP L3 MTX files (= run_dir basename).
+  # All other files have an empty rename_prefix and are saved with their
+  # original filename flat under center_id/.
   get_download_ids <- function(df_path) {
     df = read.csv(df_path, sep = "\t", na.strings = c("NA",""), header = TRUE)
-    df |> distinct(Synapse.Id, Atlas.Name) |>
+    
+    # CHOP L3 MTX files (barcodes/features/matrix) share the same three
+    # basenames across all biospecimens and run directories.  Synapse appends
+    # numeric suffixes (barcodes.tsv(7).gz) when multiple files with the same
+    # name land in the same directory.  Fix: rename each file on disk to
+    # <run_dir>___<basename> so every file in HTAN_CHOP/ is unique.
+    # snRNA directories (ped-glioma snRNA-seq) are excluded entirely.
+    chop_l3_mtx_basenames <- c("barcodes.tsv.gz", "features.tsv.gz", "matrix.mtx.gz")
+    
+    chop_l3 <- df |>
+      filter(Atlas.Name == "HTAN CHOP", Level == "Level 3",
+             basename(Filename) %in% chop_l3_mtx_basenames,
+             !grepl(",", Biospecimen), Biospecimen != "0 Biospecimens",
+             !grepl("_bak/", Filename),
+             !grepl("snRNA",  Filename)) |>
+      mutate(run_dir = basename(dirname(Filename))) |>
+      group_by(Biospecimen, run_dir) |>
+      filter(n() == 3L) |>   # drop any incomplete triplet
+      ungroup() |>
+      mutate(rename_prefix = run_dir)
+    
+    other <- df |>
+      filter(!(Atlas.Name == "HTAN CHOP" &
+                 Level == "Level 3" &
+                 basename(Filename) %in% chop_l3_mtx_basenames)) |>
+      mutate(rename_prefix = "")
+    
+    bind_rows(chop_l3, other) |>
+      distinct(Synapse.Id, Atlas.Name, rename_prefix) |>
       mutate(Atlas.Name = sub(" ", "_", Atlas.Name))
   }
   
-  # Function to download data from Synapse
-  download_synapse_data <- function(id, center_id, save_directory) {
+  # Function to download data from Synapse.
+  # rename_prefix: when non-empty, the downloaded file is renamed to
+  #   <rename_prefix>___<original_basename> in center_id/.
+  #   A per-synapse-ID temp directory is used during download so parallel
+  #   workers never write the same filename simultaneously.
+  download_synapse_data <- function(id, center_id, rename_prefix, save_directory) {
     set.seed(123)
-    
-    if (!dir.exists(save_directory)) {
-      dir.create(save_directory, recursive = TRUE)
-    }
-    
     out_dir <- file.path(save_directory, center_id)
-    if (!dir.exists(out_dir)) {
-      dir.create(out_dir, recursive = TRUE)
-    }
+    if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
     
     synLogin(authToken = Sys.getenv("SYNAPSE_TOKEN"))
-    synGet(entity = id, downloadLocation = out_dir)
-    print("saved successfully.. ")
+    
+    if (nzchar(rename_prefix)) {
+      tmp_dir <- file.path(out_dir, paste0(".tmp_", id))
+      if (!dir.exists(tmp_dir)) dir.create(tmp_dir, recursive = TRUE)
+      entity   <- synGet(entity = id, downloadLocation = tmp_dir)
+      new_name <- paste(rename_prefix, basename(entity$path), sep = "___")
+      file.rename(entity$path, file.path(out_dir, new_name))
+      unlink(tmp_dir, recursive = TRUE)
+      message("saved: ", file.path(out_dir, new_name))
+    } else {
+      synGet(entity = id, downloadLocation = out_dir)
+      message("saved: ", id)
+    }
   }
   
   list(
@@ -142,11 +182,18 @@ tar_script({
     ),
     
     tar_target(
+      rename_prefix,
+      synapse_df$rename_prefix,
+      deployment = "main"
+    ),
+    
+    tar_target(
       download_data,
       download_synapse_data(synapse_id,
                             atlas_name,
+                            rename_prefix,
                             "/vast/scratch/users/shen.m/synapse_data"),
-      pattern = map(synapse_id, atlas_name),
+      pattern = map(synapse_id, atlas_name, rename_prefix),
       resources = tar_resources(
         crew = tar_resources_crew(controller = "elastic_5_minimal")
       ) 

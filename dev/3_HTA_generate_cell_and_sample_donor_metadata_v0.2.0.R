@@ -49,7 +49,7 @@ library(stringr)
 # 1. Cell-level metadata extraction
 # =============================================================================
 
-store_file_hta_cell_metadata <- "/vast/scratch/users/shen.m/htan/hta_v020_cell_metadata_target_store"
+store_file_hta_cell_metadata <- "/vast/scratch/users/shen.m/htan/hta_v030_cell_metadata_target_store"
 
 tar_script({
   library(dplyr)
@@ -138,7 +138,7 @@ tar_script({
     tar_target(
       h5ad_files,
       list.files(
-        "/vast/scratch/users/shen.m/htan/hta_2025/0.2.0/counts/",
+        "/vast/scratch/users/shen.m/htan/hta_2025/0.3.0/parsed_counts/",
         pattern   = "\\.h5ad$",
         full.names = TRUE
       )
@@ -170,7 +170,9 @@ cell_metadata <- tar_read(cell_data_list, store = store_file_hta_cell_metadata) 
   dplyr::bind_rows() |>
   mutate(cell_id = as.numeric(cell_id)) |>
   mutate(barcode = coalesce(barcode, Barcode)) |>
-  select(-Barcode)
+  select(-Barcode) |>
+  # Temporary fix: Why 0 biospecimens were parsed? Need to investigate.
+  filter(sample_id != "0 Biospecimens")
 
 # This probably does not matter, because all index were assigned in 2_HTAN_parse_all_centers_targets.R
 # Store produced by 2_HTAN_parse_all_centers_targets.R  (organ = "breast",
@@ -222,11 +224,11 @@ cell_metadata <- tar_read(cell_data_list, store = store_file_hta_cell_metadata) 
 # cell_metadata <- cell_metadata |>
 #   dplyr::left_join(cell_index_map, by = c("cell_id" = ".cell", "sample_id"))
 
-cell_metadata |> arrow::write_parquet("/vast/scratch/users/shen.m/htan/cell_metadata_v0.2.0.parquet")
+cell_metadata |> arrow::write_parquet("/vast/scratch/users/shen.m/htan/cell_metadata_v0.3.0.parquet")
 
 dplyr::tbl(
   DBI::dbConnect(duckdb::duckdb(), dbdir = ":memory:"),
-  dplyr::sql("SELECT * FROM read_parquet('/vast/scratch/users/shen.m/htan/cell_metadata_v0.2.0.parquet')")
+  dplyr::sql("SELECT * FROM read_parquet('/vast/scratch/users/shen.m/htan/cell_metadata_v0.3.0.parquet')")
 )
 
 rm(list = ls(pattern = "index$"))
@@ -237,48 +239,84 @@ gc()
 # =============================================================================
 
 save_directory   <- "/vast/scratch/users/shen.m/htan/"
-files_meta_path  <- "/home/users/allstaff/shen.m/projects/HTAN/files_metadata_lung_breastcombined.tsv"
+files_meta_path  <- "/home/users/allstaff/shen.m/git_control/HumanTumourAtlas/inst/extdata/files_metadata_scRNAseq_synapse_level3_4.tsv"
 samples_meta_path <- "/home/users/allstaff/shen.m/git_control/HumanTumourAtlas/inst/extdata/samples_metadata_scRNAseq_synapse_level3_4.tsv"
 donors_meta_path  <- "/home/users/allstaff/shen.m/git_control/HumanTumourAtlas/inst/extdata/donors_metadata_scRNAseq_synapse_level3_4.tsv"
 
-file_metadata <- read.csv(
+file_metadata_raw <- read.csv(
   files_meta_path,
   sep        = "\t",
   na.strings = c("NA", ""),
   header     = TRUE
 ) |>
   tibble::as_tibble() |>
-
   filter(Filename != "single_cell_RNAseq_level_4_lung/lung_HTA1_203_332102_ch1_L4.tsv") |>
-  mutate(Filename_basename = basename(Filename)) |>
-  
-  # MSK and DFCI: comma-separated Biospecimen IDs → one row per biospecimen
-  tidyr::separate_rows(Biospecimen, sep = ",\\s*", convert = FALSE) |>
-  
-  # HTAPP: derive channel number from filename
   mutate(
-    channel_number = Filename_basename |>
-      stringr::str_replace_all("ch(?=[0-9]+)", "channel") |>
-      stringr::str_extract("channel[0-9]+")
+    Filename_basename = basename(Filename),
+    # run_dir used by CHOP L3 multi-run logic below
+    run_dir           = basename(dirname(Filename)),
+    # HTAPP: library_channel mirrors the targets pipeline derivation exactly:
+    #   library_id      = segment immediately before _channel{N}
+    #   library_channel = paste(library_id, channel_number, sep = "_")
+    filename_renamed  = Filename_basename |>
+      stringr::str_replace_all("ch(?=[0-9]+)", "channel"),
+    channel_number    = filename_renamed |>
+      stringr::str_extract("channel[0-9]+"),
+    library_id        = filename_renamed |>
+      stringr::str_extract("[^_]+(?=_channel[0-9]+)"),
+    library_channel   = dplyr::if_else(
+      !is.na(library_id) & !is.na(channel_number),
+      stringr::str_c(library_id, "_", channel_number),
+      NA_character_
+    )
   ) |>
-  
+  # MSK and DFCI: comma-separated Biospecimen IDs → one row per biospecimen
+  tidyr::separate_rows(Biospecimen, sep = ",\\s*", convert = FALSE)
+
+# Pre-compute which CHOP L3 biospecimens span multiple run directories.
+# Applies the same file filters as chop_l3_metadata in the targets script.
+chop_l3_multirun_bios <- file_metadata_raw |>
+  dplyr::filter(
+    Atlas.Name == "HTAN CHOP", Level == "Level 3",
+    !grepl(",", Biospecimen), Biospecimen != "0 Biospecimens",
+    !stringr::str_detect(Filename, "_bak/"),
+    !stringr::str_detect(Filename, "snRNA"),
+    Filename_basename %in% c("barcodes.tsv.gz", "features.tsv.gz", "matrix.mtx.gz")
+  ) |>
+  dplyr::group_by(Biospecimen) |>
+  dplyr::summarise(n_runs = dplyr::n_distinct(run_dir), .groups = "drop") |>
+  dplyr::filter(n_runs > 1L) |>
+  dplyr::pull(Biospecimen)
+
+file_metadata <- file_metadata_raw |>
   dplyr::group_by(Atlas.Name, Biospecimen) |>
-  mutate(
+  dplyr::mutate(
     n_files_per_biospecimen = dplyr::n(),
     sample_id = dplyr::case_when(
-      # HTAPP: biospecimen with >4 files → append channel suffix
+      # HTAPP: biospecimen with >4 files → library_channel suffix
+      # Matches: paste(Biospecimen, library_channel, sep="___") in targets
       Atlas.Name == "HTAN HTAPP" & n_files_per_biospecimen > 4 ~
-        paste(Biospecimen, channel_number, sep = "___"),
-      # All others: sample_id = Biospecimen directly
+        paste(Biospecimen, library_channel, sep = "___"),
+      # CHOP L3 multi-run → run_dir suffix, matching chop_l3_metadata target
+      Atlas.Name == "HTAN CHOP" & Level == "Level 3" &
+        Biospecimen %in% chop_l3_multirun_bios ~
+        paste(Biospecimen, run_dir, sep = "___"),
+      # All other centers: sample_id = Biospecimen
       TRUE ~ Biospecimen
     )
   ) |>
   dplyr::ungroup() |>
   dplyr::distinct(sample_id, Biospecimen, Assay, Organ, Atlas.Name, Atlasid) |>
-  mutate(
+  dplyr::mutate(
     file_id_cellNexus_single_cell = paste0(sample_id, ".h5ad"),
     file_id_cellNexus_pseudobulk  = file_id_cellNexus_single_cell
   )
+
+#  (Investigate further) Biospecimen, center id not parsed
+# existing_ids <- list.files("/vast/scratch/users/shen.m/htan/hta_2025/0.3.0/parsed_counts/")
+# file_metadata |>
+#   filter(file_id_cellNexus_single_cell %in% existing_ids) |>
+#   dplyr::count(Atlas.Name)
 
 sample_metadata <- read.csv(
   samples_meta_path,
@@ -338,10 +376,11 @@ sample_metadata <- file_metadata |>
   ungroup()
 
 sample_metadata |> dplyr::distinct(sample_id) |> dplyr::count()
+sample_metadata|>dplyr::filter(is.na(tissue)) |> dplyr::count(center) # unannotated in the source file metadata
 
 arrow::write_parquet(
   sample_metadata,
-  file.path(save_directory, "hta_sample_metadata_v0.2.0.parquet")
+  file.path(save_directory, "hta_sample_metadata_v0.3.0.parquet")
 )
 
 
@@ -353,12 +392,12 @@ con <- DBI::dbConnect(duckdb::duckdb(), dbdir = ":memory:")
 
 cell_tbl <- dplyr::tbl(
   con,
-  dplyr::sql("SELECT * FROM read_parquet('/vast/scratch/users/shen.m/htan/cell_metadata_v0.2.0.parquet')")
+  dplyr::sql("SELECT * FROM read_parquet('/vast/scratch/users/shen.m/htan/cell_metadata_v0.3.0.parquet')")
 )
 
 sample_tbl <- dplyr::tbl(
   con,
-  dplyr::sql("SELECT * FROM read_parquet('/vast/scratch/users/shen.m/htan/hta_sample_metadata_v0.2.0.parquet')")
+  dplyr::sql("SELECT * FROM read_parquet('/vast/scratch/users/shen.m/htan/hta_sample_metadata_v0.3.0.parquet')")
 )
 
 cell_sample_metadata <- cell_tbl |>
@@ -371,7 +410,7 @@ cell_sample_metadata <- cell_tbl |>
     self_reported_ethnicity = dplyr::if_else(is.na(self_reported_ethnicity), "unknown", self_reported_ethnicity),
     sex   = dplyr::if_else(is.na(sex),   "unknown",   sex),
     assay = dplyr::if_else(is.na(assay), "scRNA-seq", assay),
-    atlas_id = "hta_2025/0.2.0"
+    atlas_id = "hta_2025/0.3.0"
   )
 
 duckdb_write_parquet <- function(.tbl_sql, path, con) {
@@ -386,7 +425,7 @@ duckdb_write_parquet <- function(.tbl_sql, path, con) {
 
 duckdb_write_parquet(
   cell_sample_metadata,
-  path = "/vast/scratch/users/shen.m/htan/hta_metadata.0.2.0.parquet",
+  path = "/vast/scratch/users/shen.m/htan/hta_metadata.0.3.0.parquet",
   con  = con
 )
 
