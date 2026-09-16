@@ -13,9 +13,9 @@ library(purrr)
 #    - Synapse Data Access
 # Downloaded biospecimens (sample_meta), cases (donor_meta), and files (file_meta) metadata separately.
 
-sample_meta <- read.csv("inst/extdata/samples_metadata_scRNAseq_synapse_level3_4.tsv", sep = "\t", na.strings = c("NA",""), header = TRUE) |> head(2)
-donor_meta <- read.csv("inst/extdata/donors_metadata_scRNAseq_synapse_level3_4.tsv", sep = "\t", na.strings = c("NA",""), header = TRUE) |> head(2)
-file_meta <- read.csv("inst/extdata/files_metadata_scRNAseq_synapse_level3_4.tsv", sep = "\t", na.strings = c("NA",""), header = TRUE) |> head(2)
+sample_meta <- read.csv("inst/extdata/samples_metadata_scRNAseq_synapse_level3_4.tsv", sep = "\t", na.strings = c("NA",""), header = TRUE) #|> head(2)
+donor_meta <- read.csv("inst/extdata/donors_metadata_scRNAseq_synapse_level3_4.tsv", sep = "\t", na.strings = c("NA",""), header = TRUE) #|> head(2)
+file_meta <- read.csv("inst/extdata/files_metadata_scRNAseq_synapse_level3_4.tsv", sep = "\t", na.strings = c("NA",""), header = TRUE) #|> head(2)
 
 # Log in to Synapse, create your own token, and save to Renviron
 if (!nzchar(Sys.getenv("SYNAPSE_TOKEN", unset = ""))) {

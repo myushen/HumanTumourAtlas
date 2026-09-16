@@ -32,7 +32,7 @@
 #
 # 4. Combined metadata:
 #    - Joins cell → barcode map → sample/donor annotations
-#    - Adds atlas_id = "hta_2026/0.3.0"
+#    - Adds atlas_id = "hta_2026/0.4.0"
 #    - Saves as ZSTD-compressed parquet
 #
 # Output files:
@@ -49,7 +49,7 @@ library(stringr)
 # 1. Cell-level metadata extraction
 # =============================================================================
 
-store_file_hta_cell_metadata <- "/vast/scratch/users/shen.m/htan/hta_v030_cell_metadata_target_store"
+store_file_hta_cell_metadata <- "/vast/scratch/users/shen.m/htan/hta_v020_cell_metadata_target_store"
 
 tar_script({
   library(dplyr)
@@ -138,7 +138,7 @@ tar_script({
     tar_target(
       h5ad_files,
       list.files(
-        "/vast/scratch/users/shen.m/htan/hta_2026/0.3.0/parsed_counts/",
+        "/vast/scratch/users/shen.m/htan/hta_2026/0.4.0/counts/", ## Modify here
         pattern   = "\\.h5ad$",
         full.names = TRUE
       )
@@ -224,11 +224,11 @@ cell_metadata <- tar_read(cell_data_list, store = store_file_hta_cell_metadata) 
 # cell_metadata <- cell_metadata |>
 #   dplyr::left_join(cell_index_map, by = c("cell_id" = ".cell", "sample_id"))
 
-cell_metadata |> arrow::write_parquet("/vast/scratch/users/shen.m/htan/cell_metadata_v0.3.0.parquet")
+cell_metadata |> arrow::write_parquet("/vast/scratch/users/shen.m/htan/cell_metadata_v0.2.0.parquet")
 
 dplyr::tbl(
   DBI::dbConnect(duckdb::duckdb(), dbdir = ":memory:"),
-  dplyr::sql("SELECT * FROM read_parquet('/vast/scratch/users/shen.m/htan/cell_metadata_v0.3.0.parquet')")
+  dplyr::sql("SELECT * FROM read_parquet('/vast/scratch/users/shen.m/htan/cell_metadata_v0.2.0.parquet')")
 )
 
 rm(list = ls(pattern = "index$"))
@@ -313,7 +313,7 @@ file_metadata <- file_metadata_raw |>
   )
 
 #  (Investigate further) Biospecimen, center id not parsed
-# existing_ids <- list.files("/vast/scratch/users/shen.m/htan/hta_2026/0.3.0/parsed_counts/")
+# existing_ids <- list.files("/vast/scratch/users/shen.m/htan/hta_2026/0.4.0/counts/")
 # file_metadata |>
 #   filter(file_id_cellNexus_single_cell %in% existing_ids) |>
 #   dplyr::count(Atlas.Name)
@@ -380,7 +380,7 @@ sample_metadata|>dplyr::filter(is.na(tissue)) |> dplyr::count(center) # unannota
 
 arrow::write_parquet(
   sample_metadata,
-  file.path(save_directory, "hta_sample_metadata_v0.3.0.parquet")
+  file.path(save_directory, "hta_sample_metadata_v0.2.0.parquet")
 )
 
 
@@ -392,12 +392,12 @@ con <- DBI::dbConnect(duckdb::duckdb(), dbdir = ":memory:")
 
 cell_tbl <- dplyr::tbl(
   con,
-  dplyr::sql("SELECT * FROM read_parquet('/vast/scratch/users/shen.m/htan/cell_metadata_v0.3.0.parquet')")
+  dplyr::sql("SELECT * FROM read_parquet('/vast/scratch/users/shen.m/htan/cell_metadata_v0.2.0.parquet')")
 )
 
 sample_tbl <- dplyr::tbl(
   con,
-  dplyr::sql("SELECT * FROM read_parquet('/vast/scratch/users/shen.m/htan/hta_sample_metadata_v0.3.0.parquet')")
+  dplyr::sql("SELECT * FROM read_parquet('/vast/scratch/users/shen.m/htan/hta_sample_metadata_v0.2.0.parquet')")
 )
 
 cell_sample_metadata <- cell_tbl |>
@@ -410,7 +410,7 @@ cell_sample_metadata <- cell_tbl |>
     self_reported_ethnicity = dplyr::if_else(is.na(self_reported_ethnicity), "unknown", self_reported_ethnicity),
     sex   = dplyr::if_else(is.na(sex),   "unknown",   sex),
     assay = dplyr::if_else(is.na(assay), "scRNA-seq", assay),
-    atlas_id = "hta_2026/0.3.0"
+    atlas_id = "hta_2026/0.4.0" ## Modify here
   )
 
 duckdb_write_parquet <- function(.tbl_sql, path, con) {
@@ -425,7 +425,7 @@ duckdb_write_parquet <- function(.tbl_sql, path, con) {
 
 duckdb_write_parquet(
   cell_sample_metadata,
-  path = "/vast/scratch/users/shen.m/htan/hta_metadata.0.3.0.parquet",
+  path = "/vast/scratch/users/shen.m/htan/hta_metadata.0.2.0.parquet",
   con  = con
 )
 
@@ -446,7 +446,7 @@ test_that("get_metadata and get_single_cell_experiment return expected SCE", {
   
   # Pick one sample from each major organ to test breadth
   ids <- c(
-    "HTA1_213_6752601___channel1.h5ad",                      # HTAPP lung
+    "HTA6_2506_2.h5ad",                      # HTAPP lung
     "dc1a2e1504a4b71427b682a6300d02d3___1.h5ad"  # MSK lung
   )
   

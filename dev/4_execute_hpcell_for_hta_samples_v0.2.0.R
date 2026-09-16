@@ -13,7 +13,7 @@ library(SummarizedExperiment)
 
 cell_metadata <-  tbl(
   dbConnect(duckdb::duckdb(), dbdir = ":memory:"),
-  sql("SELECT * FROM read_parquet('/vast/scratch/users/shen.m/htan/hta_metadata.0.3.0.parquet')")
+  sql("SELECT * FROM read_parquet('/vast/scratch/users/shen.m/htan/hta_metadata.0.2.0.parquet')")
 )
 # sce = cell_metadata |>
 #   dplyr::filter(sample_id == "HTA1_203_332102"  ) |>
@@ -21,7 +21,7 @@ cell_metadata <-  tbl(
 # 
 # sce |> counts() |> as.matrix() |>  hist(ylim=c(0,1e3), breaks = 50)
 
-#breast_cell_metadata <- cell_metadata |> filter(is.na(tissue) | str_detect(tissue, "breast|Breast"))
+# Theoretically HTA counts are raw, running regular sanity check pipeline to confirm:
 summary_store = "/vast/scratch/users/shen.m/hta_check_counts_distribution_summary_target_store"
 tar_script({
   library(dplyr)
@@ -88,8 +88,14 @@ tar_script({
   }
   
   get_positive_mode <- function(x) {
-    sort(table(x[x > 0]), decreasing = TRUE)[1] |> names() |> as.numeric()
+    pos_x <- x[x > 0]
+    pos_x <- pos_x[!is.na(pos_x)]
+    
+    if (length(pos_x) == 0) return(NA_real_)
+    
+    sort(table(pos_x), decreasing = TRUE)[1] |> names() |> as.numeric()
   }
+  
   
   # Stage 1 – read SCE and return a minimal list with only what downstream needs.
   # Keeping the raw matrix avoids re-reading the file in the metrics stage, while
@@ -99,10 +105,10 @@ tar_script({
     if (ncol(sce) == 0) return(NULL)
     
     assay_name <- names(sce@assays)[1]
-    counts_mat <- assay(sce, assay_name)
+    counts_mat <- as.matrix(assay(sce, assay_name))
     
     list(
-      sample_id  = basename(file),
+      sample_id  = tools::file_path_sans_ext(basename(file)),
       counts_mat = counts_mat,
       n_cells    = ncol(counts_mat),
       n_genes    = nrow(counts_mat)
@@ -112,13 +118,6 @@ tar_script({
   # Stage 2 – pure computation on the pre-loaded matrix; no I/O.
   calc_counts_metrics <- function(sce_data) {
     if (is.null(sce_data)) return(NULL)
-    
-    # Subsample cells to 1e4 if dataset is large
-    if (ncol(sce_data$counts_mat) > 5e3) {
-      set.seed(42)
-      sampled_cols <- sample(ncol(sce_data$counts_mat), 5e3)
-      sce_data$counts_mat <- sce_data$counts_mat[, sampled_cols]
-    }
     
     counts_vec <- as.numeric(sce_data$counts_mat)
     tol        <- 1e-4
@@ -133,36 +132,33 @@ tar_script({
       counts_gap_min_mean= pos_min_mean_ratio(counts_vec),
       positive_mode      = get_positive_mode(counts_vec),
       has_negative       = min(counts_vec, na.rm = TRUE) < 0,
-      max_gt_10          = max(counts_vec, na.rm = TRUE) > 10,
       all_integer        = all_int,
-      has_floating       = !all_int && all(abs(counts_vec - round(counts_vec)) < tol, na.rm = TRUE),
+      has_rounding_error = !all_int && all(abs(counts_vec - round(counts_vec)) < tol, na.rm = TRUE),
       n_cells            = sce_data$n_cells,
-      n_genes            = sce_data$n_genes
+      n_genes            = sce_data$n_genes,
+      is_gene_expression_likely_log = max_val < 20
     )
   }
-  
-  # fx = function(sce) {
-  #   counts_vec = assay(sce, "counts") |> as.numeric()
-  #   tol        <- 1e-4
-  #   all_int    <- all(counts_vec == floor(counts_vec), na.rm = TRUE)
-  #   tibble(
-  #     sample_id = unique(sce$sample_id),
-  #     all_int = all_int
-  #   )
-  # }
   
   
   list(
     tar_target(
       files,
       list.files(
-        "/vast/scratch/users/shen.m/htan/hta_2026/0.3.0/parsed_counts/",
+        "/vast/scratch/users/shen.m/htan/hta_2026/0.4.0/counts/",
         full.names = TRUE, pattern = "\\.h5ad$"
       ) |>
         # Temporary fix - 0 Biospecimens should not be parsed
         (\(x) x[basename(x) != "0 Biospecimens.h5ad"])(),
       deployment = "main"
     ),
+    
+    tar_target(
+      counts_path,
+      "/vast/scratch/users/shen.m/htan/hta_2026/0.4.0/counts/",
+      deployment = "main"
+    ),
+    
     
     # Stage 1 – I/O-bound; needs memory for the full matrix
     tar_target(
@@ -184,6 +180,41 @@ tar_script({
       resources = tar_resources(
         crew = tar_resources_crew(controller = "elastic_5_minimal")
       )
+    ),
+    
+    tar_target(
+      sample_summary_classified,
+      sample_summary_df |>
+        bind_rows() |>
+        HPCell::impute_x_approximate_distribution(
+          counts_gap_threshold = 0.25,
+          pos_mode_threshold   = 1
+        ) |>
+        dplyr::mutate(
+          file_name = file.path(counts_path, sample_id),
+          count_upper_bound = 10,
+          method_to_apply   = dplyr::case_when(
+            inferred_distribution == "double_log1p" ~ "safe_expm1",
+            inferred_distribution == "log1p" ~ "expm1",
+            inferred_distribution == "log_negative_max_10" ~ "exp",
+            inferred_distribution %in% c("raw", "raw_scaled", "raw_negative_scaled") ~ "identity"
+          ),
+          feature_thresh = if_else(n_genes > 1e3, 200, floor(500/2e4)*n_genes)
+        )
+    ),
+    
+    tar_target(
+      sample_summary_output_path,
+      "/vast/projects/cellxgene_curated/hta/all_center_sample_summary_for_hpcell.parquet",
+      deployment = "main"
+    ),
+    
+    tar_target(
+      sample_summary_classified_parquet_file,
+      {
+        arrow::write_parquet(sample_summary_classified, sample_summary_output_path)
+        sample_summary_output_path
+      }
     )
   )
   
@@ -204,78 +235,7 @@ job::job({
 # debugonce(calc_counts_metrics)
 # calc_counts_metrics(sce_counts)
 
-sample_summary_df = tar_read(sample_summary_df, store = glue("{summary_store}/_targets")) |>
-  dplyr::bind_rows() |>  mutate(max_gt_20 = ifelse(max_val > 20, TRUE, FALSE)) 
-# |>
-#   mutate(sample_id = stringr::str_remove(sample_id, ".h5ad"))
-
-impute_x_approximate_distribution <- function(df,
-                                              counts_gap_threshold,
-                                              pos_mode_threshold) {
-  df |>
-    dplyr::mutate(
-      inferred_distribution = dplyr::case_when(
-        
-        # 0) When counts gap between 0 and next min value >= threshold
-        !has_negative & !max_gt_20 & !all_integer & !has_floating &
-          (counts_gap_min_mean >= counts_gap_threshold) & (positive_mode > pos_mode_threshold) ~ "double_log1p",
-        
-        # 1) Small counts gap
-        !has_negative & !max_gt_20 & !all_integer & !has_floating &
-          !(
-            (counts_gap_min_mean >= counts_gap_threshold) &
-              (positive_mode > pos_mode_threshold)
-            
-          ) ~ "log1p",
-        
-        # 2) No negatives, has large values
-        !has_negative & max_gt_20 & !all_integer & !has_floating ~ "raw_limit_max_to_10",
-        
-        # 3) Large values, integer counts
-        !has_negative & max_gt_20 & all_integer & !has_floating ~ "raw_limit_max_to_10",
-        
-        # 4) Has negatives, compressed range
-        has_negative & !max_gt_20 & !all_integer & !has_floating ~ "raw_limit_max_to_10",
-        
-        # 5) Has negatives and large values
-        has_negative & max_gt_20 & !all_integer & !has_floating ~ "raw_limit_max_to_10",
-        
-        # 6) No negatives, and all integers
-        !has_negative & all_integer ~  "raw_limit_max_to_10",
-         
-        # fallback
-        TRUE ~ NA_character_
-      )
-    )
-}
-
-sample_summary_df = sample_summary_df |> impute_x_approximate_distribution(0.25, 1) |> 
-  mutate(count_upper_bound = case_when(
-    # 0) When counts gap between 0 and next min value >= 0.25, double log. Max value before exp is 10.
-    inferred_distribution == "double_log1p" ~ 10,
-    
-    # 1) make 10 as max before exp
-    inferred_distribution == "log1p" ~ 10,
-    
-    # 2,3,5) transform algo picks up negative value. should always scale max to 10
-    # 4) Has negatives, no large values, no integer, no floating. Counts peak at 10
-    inferred_distribution == "raw_limit_max_to_10" ~ 10
-    
-  )) |>
-  # Inverse distribution
-  mutate(method_to_apply = case_when(inferred_distribution == "double_log1p" ~ "safe_expm1",
-                                     inferred_distribution == "log1p" ~ "expm1",
-                                     inferred_distribution == "raw_limit_max_to_10" ~ "identity_with_max_limit"))
-
-
-sample_summary_df <- sample_summary_df |>
-  mutate(file_name = file.path("/vast/scratch/users/shen.m/htan/hta_2026/0.3.0/parsed_counts/", 
-                               sample_id),
-         feature_thresh = if_else(n_genes > 1e3, 200, floor(500/2e4)*n_genes)) |>
-  select(file_name, sample_id, method_to_apply, count_upper_bound, feature_thresh)
-
-sample_summary_df |> arrow::write_parquet("/vast/projects/cellxgene_curated/hta/all_center_sample_summary_df_for_hpcell.parquet", compression = "gzip")
-sample_summary_df <- arrow::read_parquet("/vast/projects/cellxgene_curated/hta/all_center_sample_summary_df_for_hpcell.parquet")
+sample_summary_df <- arrow::read_parquet("/vast/projects/cellxgene_curated/hta/all_center_sample_summary_for_hpcell.parquet")
 
 sample_names <-
   sample_summary_df |> 
@@ -303,20 +263,21 @@ new_elastic <- function(name, mem_gb, time_min, workers, crashes_max, cpus_per_t
   )
 }
 elastic_300 <- new_elastic("elastic_300", 300, 60 * 24, workers = 4,  crashes_max = 2)
-elastic_160 <- new_elastic("elastic_160", 160, 60 * 24, workers = 8,  crashes_max = 2, backup = elastic_300)
-elastic_120  <- new_elastic("elastic_120",  120,  60 * 8,  workers = 16, crashes_max = 1, cpus_per_task = 1, backup = elastic_160)
-elastic_80  <- new_elastic("elastic_80",   80,  60 * 8,  workers = 24, crashes_max = 1, cpus_per_task = 1, backup = elastic_120)
-elastic_40  <- new_elastic("elastic_40",   40,  60 * 4,  workers = 32, crashes_max = 1, cpus_per_task = 1, backup = elastic_80)
-elastic_20  <- new_elastic("elastic_20",   20,  60 * 4,  workers = 48, crashes_max = 1, cpus_per_task = 1, backup = elastic_40)
-elastic_10   <- new_elastic("elastic_10",   10, 60 * 4,  workers = 150, crashes_max = 2, cpus_per_task = 1, backup = elastic_20)
+elastic_160 <- new_elastic("elastic_160", 160, 60 * 24, workers = 10,  crashes_max = 2, backup = elastic_300)
+elastic_120  <- new_elastic("elastic_120",  120,  60 * 8,  workers = 24, crashes_max = 1, cpus_per_task = 1, backup = elastic_160)
+elastic_80  <- new_elastic("elastic_80",   80,  60 * 8,  workers = 35, crashes_max = 1, cpus_per_task = 1, backup = elastic_120)
+elastic_40  <- new_elastic("elastic_40",   40,  60 * 4,  workers = 70, crashes_max = 1, cpus_per_task = 1, backup = elastic_80)
+elastic_20  <- new_elastic("elastic_20",   20,  60 * 4,  workers = 140, crashes_max = 1, cpus_per_task = 1, backup = elastic_40)
+elastic_10   <- new_elastic("elastic_10",   10, 60 * 4,  workers = 290, crashes_max = 2, cpus_per_task = 1, backup = elastic_20)
 
-elastic_5_minimal   <- new_elastic("elastic_5_minimal",     5, 60 * 4,  workers = 300, crashes_max = 2, cpus_per_task = 1, backup = elastic_10)
+elastic_5_minimal   <- new_elastic("elastic_5_minimal",     5, 60 * 4,  workers = 440, crashes_max = 2, cpus_per_task = 1, backup = elastic_10)
 
 # Group for targets (small → large)
 controllers <- crew::crew_controller_group(
   elastic_10, elastic_20, elastic_40, elastic_80, elastic_120, elastic_160, elastic_300, elastic_5_minimal
 )
 
+# Use HPCell "hta" branch to run the following:
 job::job({
   
   library(HPCell)
@@ -329,7 +290,7 @@ job::job({
       computing_resources = list(
         elastic_5_minimal, elastic_10, elastic_20, elastic_40, elastic_80, elastic_120, elastic_160, elastic_300
       ),
-      default_controller = "elastic_10", 
+      default_controller = "elastic_20", 
       verbosity = "summary",
       update = "never", 
       #update = "thorough", 
@@ -339,6 +300,9 @@ job::job({
       
     ) |> 
     transform_assay(fx = functions, target_output = "sce_transformed", scale_max = count_upper_bound) |>
+    
+    # sanity_check_ non sensical expression samples
+    sanity_check_transform_samples(target_input = "sce_transformed", target_output = "sanity_checked_sample_stats") |>
     
     # # Remove empty outliers based on RNA count threshold per cell
     remove_empty_threshold(target_input = "sce_transformed", RNA_feature_threshold = feature_thresh) |>
@@ -358,21 +322,14 @@ job::job({
     # Doublets identification
     remove_doublets_scDblFinder(target_input = "sce_transformed") |>
     
-    # # SCT
-    # normalise_abundance_seurat_SCT(target_input = "sce_transformed", factors_to_regress = c(
-    #   "subsets_Mito_percent",
-    #   "subsets_Ribo_percent")) |>
-    # 
-    # # Pseudobulk
-    # calculate_pseudobulk(target_input = "sce_transformed",
-    #                      group_by = "cell_type_unified_ensemble") |>
-    
-    # # metacell
-    # cluster_metacell(target_input = "sce_transformed",  group_by = "cell_type_unified_ensemble") |>
-    # 
-    # # Cell Chat
-    # ligand_receptor_cellchat(target_input = "sce_transformed",
-    #                          group_by = "cell_type_unified_ensemble") |>
+    # SCT
+    normalise_abundance_seurat_SCT(target_input = "sce_transformed", factors_to_regress = c(
+      "subsets_Mito_percent",
+      "subsets_Ribo_percent")) |>
+
+    # Pseudobulk
+    calculate_pseudobulk(target_input = "sce_transformed",
+                         group_by = "cell_type_unified_ensemble") |>
     
     print()
   
@@ -387,293 +344,193 @@ job::job({
 
 tar_progress_branches(store = my_store) |> mutate(pending = branches - skipped - completed)
 
-#' Pipeline for Lightening Annotations in High-Performance Computing Environment
-#' 
-#' This pipeline is designed to read, process, and "lighten" large annotation tables in an HPC environment.
-#' It uses the `targets` package for reproducibility and `crew` for efficient job scheduling on a Slurm cluster.
-#' The `lighten_annotation` function selects and processes specific columns from large tables to reduce memory usage.
-#' 
-#' The pipeline consists of:
-#' - **Crew Controllers**: Four tiers of Slurm controllers with varying memory allocations to optimize resource usage.
-#' - **Targets**:
-#'   - `my_store`: Defines the path to the target storage directory, ensuring all targets use the correct storage location.
-#'   - `target_name`: Retrieves metadata to identify branch targets for annotation.
-#'   - `annotation_tbl_light`: Applies `lighten_annotation` to process each target name, optimally running with `tier_1` resources.
-#' 
-#' @libraries:
-#'   - `dplyr`, `magrittr`, `tibble`, `targets`, `tarchetypes` for data manipulation and pipeline structure.
-#'   - `crew`, `crew.cluster` for parallel computation and cluster scheduling in an HPC environment.
-#' 
-#' @options:
-#'   - Memory settings, garbage collection frequency, and error handling are set to handle large data efficiently.
-#'   - The `cue` option is set to `never` for forced target updates if needed.
-#'   - `controller` is a group of Slurm controllers to manage computation across memory tiers.
-#' 
-#' @function `lighten_annotation`: Processes each annotation table target, unnesting and selecting specific columns to reduce data size.
-#'
-#' @example Usage:
-#'   The pipeline script is saved as `/vast/scratch/users/shen.m/lighten_annotation_tbl_target.R` by tar_script and can be run using `tar_make()`.
-conflicted::conflict_prefer("filter", "dplyr")
-tar_script({
-  library(dplyr)
-  library(magrittr)
-  library(tibble)
-  library(targets)
-  library(tarchetypes)
-  library(crew)
-  library(crew.cluster)
-  # Helper (optional) to avoid repetition
-  new_elastic <- function(name, mem_gb, time_min, workers, crashes_max, cpus_per_task = 2, backup = NULL) {
-    crew_controller_slurm(
-      name = name,
-      workers = workers,
-      crashes_max = crashes_max,
-      seconds_idle = 30,
-      options_cluster = crew_options_slurm(
-        memory_gigabytes_required = mem_gb,
-        cpus_per_task = cpus_per_task,
-        time_minutes = time_min
-      ),
-      backup = backup
-    )
-  }
-  
-  # Small → large, with fallbacks to the next size up
-  elastic_160 <- new_elastic("elastic_160", 160, 60 * 24, workers = 8,  crashes_max = 2)
-  elastic_120  <- new_elastic("elastic_120",  120,  60 * 4,  workers = 16, crashes_max = 1, cpus_per_task = 1, backup = elastic_160)
-  elastic_80  <- new_elastic("elastic_80",   80,  60 * 4,  workers = 24, crashes_max = 1, cpus_per_task = 1, backup = elastic_120)
-  elastic_40  <- new_elastic("elastic_40",   40,  60 * 4,  workers = 32, crashes_max = 1, cpus_per_task = 1, backup = elastic_80)
-  elastic_20  <- new_elastic("elastic_20",   20,  60 * 4,  workers = 48, crashes_max = 1, cpus_per_task = 1, backup = elastic_40)
-  elastic_10   <- new_elastic("elastic_10",   10, 60 * 4,  workers = 150, crashes_max = 2, cpus_per_task = 1, backup = elastic_20)
-  
-  elastic_5_minimal   <- new_elastic("elastic_5_minimal",     5, 60 * 4,  workers = 300, crashes_max = 2, cpus_per_task = 1, backup = elastic_10)
-  
-  # Group for targets (small → large)
-  controllers <- crew_controller_group(
-    elastic_10, elastic_20, elastic_40, elastic_80, elastic_120, elastic_160, elastic_5_minimal
-  )
-  
-  tar_option_set(
-    memory = "transient", 
-    garbage_collection = 100, 
-    storage = "worker", 
-    retrieval = "worker", 
-    error = "continue", 
-    cue = tar_cue(mode = "thorough"), 
-    resources = tar_resources(
-      crew = tar_resources_crew(controller = "elastic_5_minimal")
-    ),
-    controller = controllers, 
-    trust_object_timestamps = TRUE
-  )
-  
-  lighten_annotation = function(target_name, my_store ){
-    annotation_tbl = tar_read_raw( target_name,  store = my_store )
-    if(annotation_tbl |> is.null()) { 
-      warning("this annotation is null -> ", target_name)
-      return(NULL) 
-    }
-    
-    annotation_tbl |> 
-      unnest(blueprint_scores_fine) |> 
-      select(.cell, starts_with("sample"), blueprint_first.labels.fine, monaco_first.labels.fine, any_of("azimuth_predicted.celltype.l2"), monaco_scores_fine, contains("macro"), contains("CD4") ) |> 
-      unnest(monaco_scores_fine) |> 
-      select(.cell, starts_with("sample"), blueprint_first.labels.fine, monaco_first.labels.fine, any_of("azimuth_predicted.celltype.l2"), contains("macro") , contains("CD4"), contains("helper"), contains("Th")) |> 
-      rename(cell_ = .cell)
-  }
-  
-  list(
-    
-    # The input DO NOT DELETE
-    tar_target(my_store, "/vast/scratch/users/shen.m/hta_all_centers_run_hpcell_target_store", deployment = "main"),
-    
-    tar_target(
-      target_name,
-      tar_meta(
-        starts_with("annotation_tbl_"), 
-        store = my_store) |> 
-        filter(type=="branch") |> 
-        pull(name),
-      deployment = "main"
-    )    ,
-    
-    tar_target(
-      annotation_tbl_light,
-      lighten_annotation(target_name, my_store),
-      packages = c("dplyr", "tidyr"),
-      pattern = map(target_name),
-      resources = tar_resources(
-        crew = tar_resources_crew(controller = "elastic_5_minimal")
-      )
-    )
-  )
-  
-  
-}, script = "/vast/scratch/users/shen.m/hta_lighten_annotation_tbl_target.R", ask = FALSE)
-
-job::job({
-  
-  tar_make(
-    script = "/vast/scratch/users/shen.m/hta_lighten_annotation_tbl_target.R",
-    store = "/vast/scratch/users/shen.m/hta_lighten_annotation_tbl_target", 
-    reporter = "summary"
-  )
-  
-})
 
 # Sample metadata
 library(arrow)
 library(dplyr)
 library(duckdb)
 library(targets)
+library(glue)
 
-con <- dbConnect(duckdb::duckdb(), dbdir = ":memory:")
+cell_metadata_parquet   <- "/vast/scratch/users/shen.m/htan/hta_metadata.0.2.0.parquet"
+metadata_assembly_store <- "/vast/scratch/users/shen.m/htan/cell_metadata_assembly_target_store"
 
-# Write annotation light
-cell_metadata <- 
-  tbl(
-    con,
-    sql("SELECT * FROM read_parquet('/vast/scratch/users/shen.m/htan/hta_metadata.0.3.0.parquet')")
+tar_script({
+  library(dplyr)
+  library(duckdb)
+  library(targets)
+  library(stringr)
+  library(crew)
+  library(crew.cluster)
+  
+  my_store                <- "/vast/scratch/users/shen.m/hta_all_centers_run_hpcell_target_store"# MODIFY HERE: HPCell targets store (must match my_store above)
+  cell_metadata_parquet   <- "/vast/scratch/users/shen.m/htan/hta_metadata.0.2.0.parquet"
+  metadata_assembly_store <- "/vast/scratch/users/shen.m/htan/cell_metadata_assembly_target_store"
+  cell_metadata_qc_parquet <- "/vast/projects/cellxgene_curated/hta/hta_2026.v0.2.0.parquet"
+  sample_summary_parquet_path <- "/vast/projects/cellxgene_curated/hta/all_center_sample_summary_for_hpcell.parquet"
+  
+  elastic_50 <- crew_controller_slurm(
+    name         = "elastic_50",
+    workers      = 2,
+    crashes_max  = 1,
+    seconds_idle = 30,
+    options_cluster = crew_options_slurm(
+      memory_gigabytes_required = 50,
+      cpus_per_task             = 1,
+      time_minutes              = 60 * 24
+    )
   )
+  
+  tar_option_set(
+    memory             = "transient",
+    garbage_collection = 100,
+    error              = "continue",
+    format             = "qs",
+    controller         = crew_controller_group(elastic_50)
+  )
+  
+  list(
+    # Joins cell metadata with all HPCell outputs and writes the annotation parquet.
+    # Keeps a single DuckDB connection alive across all copy=TRUE left_joins.
+    tar_target(
+      cell_annotation_parquet_file,
+      {
+        con <- DBI::dbConnect(duckdb::duckdb(), dbdir = ":memory:")
+        on.exit(DBI::dbDisconnect(con), add = TRUE)
+        
+        cell_metadata <- tbl(
+          con,
+          dplyr::sql(paste0("SELECT * FROM read_parquet('", cell_metadata_parquet, "')"))
+        )
+        
+        empty_droplet <- tar_read(empty_tbl, store = my_store) |>
+          dplyr::bind_rows() |>
+          dplyr::rename(cell_ = .cell)
+        
+        alive_cells <- tar_read(alive_tbl, store = my_store) |>
+          dplyr::bind_rows() |>
+          dplyr::select(-dplyr::any_of(c("cell_type_unified_ensemble", "observation_originalid"))) |>
+          dplyr::rename(cell_ = .cell)
+        
+        doublet_cells <- tar_read(doublet_tbl, store = my_store) |>
+          dplyr::bind_rows() |>
+          dplyr::rename(cell_ = .cell)
+        
+        cell_type_concensus_tbl <- tar_read(cell_type_concensus_tbl, store = my_store) |>
+          dplyr::bind_rows() |>
+          dplyr::rename(cell_ = .cell) |>
+          dplyr::mutate(cell_type_unified_ensemble = ifelse(
+            is.na(cell_type_unified_ensemble), "Unknown", cell_type_unified_ensemble
+          ))
+        
+        sanity_checked_df <- tar_read(sanity_checked_sample_stats_combined, store = my_store) |>
+          mutate(
+            `max_lt_10,min_lt_0,rounding_error` = paste(
+              coalesce(sanity_check_max_lt_10, 0),
+              coalesce(sanity_check_min_lt_0, 0),
+              coalesce(sanity_check_rounding_error, 0),
+              sep = ","
+            )
+          )
+        
+        cell_metadata_joined <- cell_metadata |>
+          dplyr::left_join(empty_droplet, by = c("cell_id" = "cell_", "sample_id"),         copy = TRUE) |>
+          dplyr::left_join(cell_type_concensus_tbl, by = c("cell_id" = "cell_", "sample_id"), copy = TRUE) |>
+          dplyr::left_join(alive_cells, by = c("cell_id" = "cell_", "sample_id"),            copy = TRUE) |>
+          dplyr::left_join(doublet_cells, by = c("cell_id" = "cell_", "sample_id"),           copy = TRUE)
+        # |>
+        #   dplyr::left_join(metacell, copy = TRUE)
+        
+        cell_metadata_joined2 <- cell_metadata_joined |>
+          dplyr::mutate(
+            cell_type_unified_ensemble    = dplyr::coalesce(cell_type_unified_ensemble,    "Unknown"),
+            data_driven_ensemble          = dplyr::coalesce(data_driven_ensemble,          "Unknown"),
+            blueprint_first_labels_fine   = dplyr::coalesce(blueprint_first_labels_fine,   "Other"),
+            monaco_first_labels_fine      = dplyr::coalesce(monaco_first_labels_fine,      "Other"),
+            azimuth_predicted_celltype_l2 = dplyr::coalesce(azimuth_predicted_celltype_l2, "Other"),
+            azimuth                       = dplyr::coalesce(azimuth,                       "Other"),
+            blueprint                     = dplyr::coalesce(blueprint,                     "Other"),
+            monaco                        = dplyr::coalesce(monaco,                        "Other")
+          ) |>
+          dplyr::rename(
+            cell_annotation_blueprint_singler = blueprint_first_labels_fine,
+            cell_annotation_monaco_singler = monaco_first_labels_fine,
+            cell_annotation_azimuth_l2 = azimuth_predicted_celltype_l2
+          ) |>
+          
+          left_join(
+            arrow::read_parquet(sample_summary_parquet_path) |>
+              select(sample_id, feature_thresh, inferred_distribution, method_to_apply, count_upper_bound,
+                     n_genes) |>
+              mutate(sample_id = stringr::str_remove(sample_id, ".h5ad")),
+            by = "sample_id",
+            copy = TRUE
+          ) |>
+          left_join(sanity_checked_df, by = "sample_id", copy = TRUE) |>
+          dplyr::rename(inversed_inferred_distribution = method_to_apply,
+                        nfeature_expressed_threshold = feature_thresh,
+                        # feature count for each sample
+                        feature_count = n_genes )
+        
+        pb_df <- cell_metadata_joined2 |> 
+          filter(!empty_droplet, alive, scDblFinder.class != "doublet") |>
+          dplyr::count(sample_id, cell_type_unified_ensemble, name = ".aggregated_cells")
+        
+        final_cell_metadata <- cell_metadata_joined2 |> 
+          left_join(pb_df, by = c("sample_id", "cell_type_unified_ensemble"))
+        
+        # Unify cell metadata annotations
+        raw_cols <- final_cell_metadata |> colnames()
+        pattern_drop <- c(
+          grep("^scores", raw_cols, value = TRUE),
+          grep("coarse$", raw_cols, value = TRUE)
+        )
+        
+        explicit_drop <- c("azimuth",
+                           "blueprint",
+                           "monaco",
+                           "subsets_Mito_sum",
+                           "subsets_Mito_detected",
+                           "ensemble_joinid",
+                           "cell_type_unified",
+                           "data_driven_ensemble")
+        
+        drop_cols <- intersect(unique(c(explicit_drop, pattern_drop)), raw_cols)
+        
+        final_cell_metadata <- final_cell_metadata |>
+          select(!all_of(drop_cols))
+        
+        final_sql <- dbplyr::sql_render(final_cell_metadata)
+        DBI::dbExecute(con, sprintf(
+          "COPY (%s) TO '%s' (FORMAT PARQUET, COMPRESSION 'zstd')",
+          final_sql, cell_metadata_qc_parquet
+        ))
+        cell_metadata_qc_parquet
+      },
+      format = "file",
+      resources = tar_resources(
+        crew = tar_resources_crew(controller = "elastic_50")
+      )
+    )
+  )
+  
+}, ask = FALSE, script = glue("{metadata_assembly_store}/_targets.R"))
 
-cell_annotation = 
-  tar_read(annotation_tbl_light, store = "/vast/scratch/users/shen.m/hta_lighten_annotation_tbl_target") |> 
-  dplyr::rename(
-    blueprint_first_labels_fine = blueprint_first.labels.fine, 
-    monaco_first_labels_fine = monaco_first.labels.fine, 
-    azimuth_predicted_celltype_l2 = azimuth_predicted.celltype.l2
-  ) 
-
-cell_annotation = cell_annotation |> mutate(
-  blueprint_first_labels_fine = ifelse(is.na(blueprint_first_labels_fine), "Other", blueprint_first_labels_fine),
-  monaco_first_labels_fine = ifelse(is.na(monaco_first_labels_fine), "Other", monaco_first_labels_fine),
-  azimuth_predicted_celltype_l2=ifelse(is.na(azimuth_predicted_celltype_l2), "Other", azimuth_predicted_celltype_l2))
-
-# # cell_annotation |> arrow::write_parquet("/vast/projects/cellxgene_curated/metadata_cellxgene_mengyuan/annotation_tbl_light.parquet",
-# #                                         compression = "zstd")
-# cell_annotation |> arrow::write_parquet("~/scratch/cache_temp/annotation_tbl_light.parquet",
-#                                         compression = "zstd")
-
-empty_droplet = 
-  tar_read(empty_tbl, store = "/vast/scratch/users/shen.m/hta_all_centers_run_hpcell_target_store") |>
-  bind_rows() |>
-  dplyr::rename(cell_ = .cell)
-
-alive_cells = 
-  tar_read(alive_tbl, store = "/vast/scratch/users/shen.m/hta_all_centers_run_hpcell_target_store") |>
-  bind_rows() |>
-  dplyr::rename(cell_ = .cell) |>
-  select(-cell_type_unified_ensemble)
-
-doublet_cells =
-  tar_read(doublet_tbl, store = "/vast/scratch/users/shen.m/hta_all_centers_run_hpcell_target_store") |>
-  bind_rows() |>
-  dplyr::rename(cell_ = .cell)
-
-# metacell = 
-#   tar_read(metacell_tbl, store = "/vast/scratch/users/shen.m/hta_all_centers_run_hpcell_target_store") |> 
-#   bind_rows() |> 
-#   dplyr::rename(cell_ = cell) |> 
-#   dplyr::rename_with(
-#     ~ stringr::str_replace(.x, "^gamma", "metacell_"),
-#     starts_with("gamma")
-#   )
-
-# Save cell type concensus tbl from HPCell output to disk
-cell_type_concensus_tbl = tar_read(cell_type_concensus_tbl, store = "/vast/scratch/users/shen.m/hta_all_centers_run_hpcell_target_store") |>  
-  bind_rows() |> 
-  dplyr::rename(cell_ = .cell)
-
-cell_type_concensus_tbl = cell_type_concensus_tbl |> mutate(cell_type_unified_ensemble = 
-                                                              ifelse(is.na(cell_type_unified_ensemble),
-                                                                     "Unknown",
-                                                                     cell_type_unified_ensemble))
-
-cell_metadata_joined = cell_metadata |> 
-  left_join(empty_droplet, by = c("cell_id" = "cell_", "sample_id"), copy=TRUE) |>  
-  left_join(cell_type_concensus_tbl, by = c("cell_id" = "cell_", "sample_id"),copy=TRUE) |>
-  #left_join(cell_annotation, copy=TRUE) |>  
-  left_join(alive_cells, by = c("cell_id" = "cell_", "sample_id"),copy=TRUE) |> 
-  left_join(doublet_cells, by = c("cell_id" = "cell_", "sample_id"),copy=TRUE)
-# |>
-#   left_join(metacell, copy=TRUE)
-
-cell_metadata_joined |> filter(is.na(blueprint_first_labels_fine))
-
-# Keep everything as a lazy DuckDB query — no as_tibble(), no in-RAM materialisation.
-# coalesce() translates directly to SQL COALESCE
-cell_metadata_joined2 = cell_metadata_joined |>
-  mutate(
-    cell_type_unified_ensemble    = coalesce(cell_type_unified_ensemble,    "Unknown"),
-    data_driven_ensemble          = coalesce(data_driven_ensemble,          "Unknown"),
-    blueprint_first_labels_fine   = coalesce(blueprint_first_labels_fine,   "Other"),
-    monaco_first_labels_fine      = coalesce(monaco_first_labels_fine,      "Other"),
-    azimuth_predicted_celltype_l2 = coalesce(azimuth_predicted_celltype_l2, "Other"),
-    azimuth                       = coalesce(azimuth,                       "Other"),
-    blueprint                     = coalesce(blueprint,                     "Other"),
-    monaco                        = coalesce(monaco,                        "Other")
-  ) |>
-  left_join(
-    sample_summary_df |>
-      select(sample_id, method_to_apply) |>
-      mutate(sample_id = stringr::str_remove(sample_id, ".h5ad")),
-    by = "sample_id",
-    copy = TRUE
-  ) |>
-  dplyr::rename(inverse_transform = method_to_apply)
-
-# Unify cell metadata annotations
-raw_cols <- cell_metadata_joined2 |> colnames()
-pattern_drop <- c(
-  grep("^scores", raw_cols, value = TRUE),
-  grep("coarse$", raw_cols, value = TRUE)
-)
-explicit_drop <- c("azimuth",
-                   "blueprint",
-                   "monaco",
-                   "subsets_Mito_sum",
-                   "subsets_Mito_detected",
-                   "ensemble_joinid",
-                   "cell_type_unified",
-                   "data_driven_ensemble")
-conflicted::conflicts_prefer(base::intersect)
-drop_cols <- intersect(unique(c(explicit_drop, pattern_drop)), raw_cols)
-
-# Append pseudobulk count — pb_df stays lazy (same DuckDB connection, no copy needed)
-conflicted::conflicts_prefer(dplyr::filter)
-pb_df = cell_metadata_joined2 |> 
-  filter(!empty_droplet, alive, scDblFinder.class != "doublet") |>
-  count(sample_id, cell_type_unified_ensemble, name = ".aggregated_cells")
-
-cell_metadata_joined2 <- cell_metadata_joined2 |> 
-  left_join(pb_df, by = c("sample_id", "cell_type_unified_ensemble"))
-
-cell_metadata_joined2 |>
-  select(!all_of(drop_cols)) |>
-  glimpse()
-
-# Write via DuckDB COPY TO — streams directly to parquet without materialising in R RAM
-output_path <- "/vast/projects/cellxgene_curated/hta/hta_2026.v0.1.0.parquet"
-final_sql <- dbplyr::sql_render(cell_metadata_joined2 |> select(!all_of(drop_cols)))
-DBI::dbExecute(con, sprintf(
-  "COPY (%s) TO '%s' (FORMAT PARQUET, COMPRESSION 'zstd')",
-  final_sql, output_path
-))
-
-rm(alive_cells, cell_annotation, empty_droplet, cell_type_concensus_tbl, doublet_cells)
-gc()
-
-# # Cellchat output
-# ligand_receptor_tbl = tar_read(ligand_receptor_tbl, store = "/vast/scratch/users/shen.m/hta_all_centers_run_hpcell_target_store") |> bind_rows()
-
-# tar_meta(store = my_store, starts_with("sct")) |> pull(name) |> _[[1]] |>
-#   tar_read_raw(store = my_store)
+job::job({
+  
+  tar_make(
+    reporter = "summary",
+    script = glue("{metadata_assembly_store}/_targets.R"),
+    store = glue("{metadata_assembly_store}/_targets")
+  )
+  
+})
 
 
 # Save counts, cpm, rank, sct
 library(targets)
 library(tidyverse)
-store_file_cellNexus = "/vast/scratch/users/shen.m/htan/hta/targets_run_normalised_counts_v0.3.0"
+store_file_cellNexus = "/vast/scratch/users/shen.m/htan/hta/targets_run_normalised_counts_v0.4.0"
 
 tar_script({
   library(dplyr)
@@ -984,10 +841,10 @@ tar_script({
     
     # The input DO NOT DELETE
     tar_target(my_store, "/vast/scratch/users/shen.m/hta_all_centers_run_hpcell_target_store", deployment = "main"), # MODIFY HERE: HPCell targets store to read SCEs from
-    tar_target(cache_directory, "/vast/scratch/users/shen.m/hta_2026/0.3.0", deployment = "main"), # MODIFY HERE: output cache directory for saved anndata files
+    tar_target(cache_directory, "/vast/scratch/users/shen.m/htan/hta_2026/0.4.0", deployment = "main"), # MODIFY HERE: output cache directory for saved anndata files
     tar_target(
       cell_metadata,
-      "/vast/projects/cellxgene_curated/hta/hta_2026.v0.1.0.parquet", # MODIFY HERE: final metadata parquet (should match the COPY TO output above)
+      "/vast/projects/cellxgene_curated/hta/hta_2026.v0.2.0.parquet", # MODIFY HERE: final metadata parquet (should match the COPY TO output above)
       packages = c( "arrow","dplyr","duckdb")
       
     ),
@@ -1002,15 +859,15 @@ tar_script({
       deployment = "main"
     ),
     
-    # tar_target(
-    #   sct_target_name,
-    #   tar_meta(
-    #     starts_with("sct_matrix_"),
-    #     store = my_store) |>
-    #     filter(type=="branch") |>
-    #     pull(name),
-    #   deployment = "main"
-    # ),
+    tar_target(
+      sct_target_name,
+      tar_meta(
+        starts_with("sct_matrix_"),
+        store = my_store) |>
+        filter(type=="branch") |>
+        pull(name),
+      deployment = "main"
+    ),
     
     tar_target(
       sample_id_sce_df,
@@ -1020,21 +877,21 @@ tar_script({
       pattern = map(target_name)
     ),
     
-    # tar_target(
-    #   sample_id_sct_df,
-    #   get_sample_id(sct_target_name, cell_metadata, my_store) |>
-    #     as_tibble() |> dplyr::rename(sct_target_name = target_name),
-    #   packages = "tidySingleCellExperiment",
-    #   pattern = map(sct_target_name)
-    # ),
+    tar_target(
+      sample_id_sct_df,
+      get_sample_id(sct_target_name, cell_metadata, my_store) |>
+        as_tibble() |> dplyr::rename(sct_target_name = target_name),
+      packages = "tidySingleCellExperiment",
+      pattern = map(sct_target_name)
+    ),
     
     # join
     tar_target(
       sample_id_target_names_df,
-      sample_id_sce_df
+      sample_id_sce_df |>
       # Uncomment when sct is done pre-calculation
-      # |> 
-      #   left_join(sample_id_sct_df, by = c("sample_id"), copy=T)
+      # |>
+        left_join(sample_id_sct_df, by = c("sample_id"), copy=T)
     ),
     
     tar_target(
@@ -1042,8 +899,7 @@ tar_script({
       create_chunks_for_reading_and_saving(sample_id_target_names_df, cell_metadata) |> 
         # 
         # # FOR TESTING PURPOSE ONLY
-        # filter(file_id_cellNexus_single_cell %in% c("HTA8_2016_1.h5ad",
-        #                                             "HTA1_274_4891101___channel1.h5ad")) |>
+        # filter(file_id_cellNexus_single_cell %in% c("HTA8_2016_1.h5ad")) |>
         
         group_by(sample_id, file_id_cellNexus_single_cell) |>
         tar_group(),
@@ -1062,42 +918,42 @@ tar_script({
       packages = c("tidySingleCellExperiment", "SingleCellExperiment", "glue", "tidyverse", "HPCell", "digest", "scater", "dplyr", "duckdb")
     ),
     
-    tar_target(
-      saved_anndata,
-      save_anndata(sample_id_sce, paste0(cache_directory, "/counts")),
-      pattern = map(sample_id_sce),
-      packages = c("tidySingleCellExperiment", "SingleCellExperiment", "glue", "tidyverse", "HPCell", "digest", "scater", "dplyr", "duckdb")
-    )
-    
-    # 
     # tar_target(
-    #   sample_id_sct,
-    #   read_target(target_name_grouped_by_sample_id, my_store, "sct_target_name", "sct"),
-    #   pattern = map(target_name_grouped_by_sample_id),
-    #   packages = c("tidySingleCellExperiment", "SingleCellExperiment", "glue", "tidyverse", "HPCell", "digest", "scater", "dplyr", "duckdb")
-    # ),
-    # 
-    # tar_target(
-    #   saved_sample_cpm,
-    #   save_anndata_cpm(sample_id_sce, paste0(cache_directory, "/cpm")),
+    #   saved_anndata,
+    #   save_anndata(sample_id_sce, paste0(cache_directory, "/counts")),
     #   pattern = map(sample_id_sce),
-    #   packages = c("tidySingleCellExperiment", "SingleCellExperiment", "glue", "tidyverse", "HPCell", "digest", "scater", "dplyr", "duckdb")
-    # ),
-    # tar_target(
-    #   saved_dataset_rank,
-    #   save_rank_per_cell(sample_id_sce, paste0(cache_directory, "/rank")),
-    #   pattern = map(sample_id_sce),
-    #   packages = c("tidySingleCellExperiment", "SingleCellExperiment", "glue", "tidyverse", "HPCell", "digest", "scater", "dplyr", "duckdb"),
-    #   resources = tar_resources(
-    #     crew = tar_resources_crew(controller = "elastic_40")
-    #   ), 
-    # ),
-    # tar_target(
-    #   saved_sct,
-    #   save_anndata_sct(sample_id_sct, paste0(cache_directory, "/sct")),
-    #   pattern = map(sample_id_sct),
     #   packages = c("tidySingleCellExperiment", "SingleCellExperiment", "glue", "tidyverse", "HPCell", "digest", "scater", "dplyr", "duckdb")
     # )
+    
+    # 
+    tar_target(
+      sample_id_sct,
+      read_target(target_name_grouped_by_sample_id, my_store, "sct_target_name", "sct"),
+      pattern = map(target_name_grouped_by_sample_id),
+      packages = c("tidySingleCellExperiment", "SingleCellExperiment", "glue", "tidyverse", "HPCell", "digest", "scater", "dplyr", "duckdb")
+    ),
+
+    tar_target(
+      saved_sample_cpm,
+      save_anndata_cpm(sample_id_sce, paste0(cache_directory, "/cpm")),
+      pattern = map(sample_id_sce),
+      packages = c("tidySingleCellExperiment", "SingleCellExperiment", "glue", "tidyverse", "HPCell", "digest", "scater", "dplyr", "duckdb")
+    ),
+    tar_target(
+      saved_dataset_rank,
+      save_rank_per_cell(sample_id_sce, paste0(cache_directory, "/rank")),
+      pattern = map(sample_id_sce),
+      packages = c("tidySingleCellExperiment", "SingleCellExperiment", "glue", "tidyverse", "HPCell", "digest", "scater", "dplyr", "duckdb"),
+      resources = tar_resources(
+        crew = tar_resources_crew(controller = "elastic_40")
+      ),
+    ),
+    tar_target(
+      saved_sct,
+      save_anndata_sct(sample_id_sct, paste0(cache_directory, "/sct")),
+      pattern = map(sample_id_sct),
+      packages = c("tidySingleCellExperiment", "SingleCellExperiment", "glue", "tidyverse", "HPCell", "digest", "scater", "dplyr", "duckdb")
+    )
     
   )
 }, script = paste0(store_file_cellNexus, "_target_script.R"), ask = FALSE)
@@ -1130,7 +986,7 @@ tar_progress_branches(store = store_file_cellNexus) |> mutate(pending = branches
 library(cellNexus)
 library(tidyr)
 library(ggplot2)
-x = get_metadata(cloud_metadata = NULL, local_metadata = "/vast/projects/cellxgene_curated/hta/hta_2026.v0.1.0.parquet")
+x = get_metadata(cloud_metadata = NULL, local_metadata = "/vast/projects/cellxgene_curated/hta/hta_2026.v0.2.0.parquet")
 x |> dplyr::count()
 
 qc_summary <- x |>
@@ -1142,7 +998,7 @@ qc_summary <- x |>
       TRUE ~ "Good cells"
     )
   ) |>
-  count(category) |>
+  dplyr::count(category) |>
   collect() |>
   mutate(pct = n / sum(n) * 100)
 
@@ -1171,10 +1027,11 @@ ggplot(qc_summary, aes(x = reorder(category, -pct), y = pct, fill = category)) +
 #       (annotation == "scDblFinder.class" & value == "doublet")
 #   )
 
-sce = x |> keep_quality_cells() |>  # FOR TESTING PURPOSE ONLY
+sce = x |> 
+  keep_quality_cells() |> 
   filter(sample_id %in% c("HTA1_254_571101",
                           "HTA1_141_119201")) |>
-  get_single_cell_experiment(assays = c("counts"), cache_directory = "/vast/scratch/users/shen.m/", repository = NULL)
+  get_single_cell_experiment(assays = c("counts"), cache_directory = "/vast/scratch/users/shen.m/htan/", repository = NULL)
 
 
 # pb = x |> keep_quality_cells() |> 
@@ -1182,79 +1039,5 @@ sce = x |> keep_quality_cells() |>  # FOR TESTING PURPOSE ONLY
 #   filter(file_id_cellNexus_single_cell %in% c("HTA1_254_571101.h5ad",
 #                                               "HTA1_231_6758320___channel2.h5ad")) |>
 #   get_pseudobulk(cache_directory = "/vast/scratch/users/shen.m/htan/", repository = NULL)
-
-
-# Tissue groups
-
-get_tissue_grouped <- function() {
-  list(
-    "breast nos" = "Breast",
-    "colon nos" = "Colorectal",
-    "lung nos" = "Lung",
-    "abdomen nos" = "Other and Ill-defined Sites",
-    "upper-outer quadrant of breast" = "Breast",
-    "blood" = "Bone Marrow",
-    "not reported" = "Not Reported",
-    "adrenal gland nos" = "Adrenal Gland",
-    "ovary" = "Ovary",
-    "pancreas nos" = "Pancreas",
-    "bone marrow" = "Bone Marrow",
-    "skin of trunk, vulva nos, skin of upper limb and shoulder" = "Skin",
-    "upper-inner quadrant of breast" = "Breast",
-    "lower lobe lung" = "Lung",
-    "brain nos" = "Brain",
-    "lymph node nos" = "Lymph Nodes",
-    "upper lobe lung" = "Lung",
-    "unknown" = "Not Reported",
-    "liver" = "Liver",
-    "cervix uteri" = "Cervix",
-    "skin of trunk, unknown, skin of upper limb and shoulder" = "Skin",
-    "endometrium" = "Uterus",
-    "skin of upper limb and shoulder, skin of trunk, lymph nodes of axilla or arm" = "Skin",
-    "lower-outer quadrant of breast" = "Breast",
-    "overlapping lesion of breast" = "Breast",
-    "mediastinum nos" = "Other and Ill-defined Sites",
-    "lower-inner quadrant of breast" = "Breast",
-    "tonsil nos" = "Head and Neck",
-    "descending colon" = "Colorectal",
-    "kidney nos" = "Kidney",
-    "ascending colon" = "Colorectal",
-    "middle lobe lung" = "Lung",
-    "unknown primary site" = "Not Reported",
-    "rectum nos" = "Colorectal",
-    "skin of upper limb and shoulder" = "Skin",
-    "base of tongue nos" = "Head and Neck",
-    "retroperitoneum" = "Other and Ill-defined Sites",
-    "lower limb nos" = "Other and Ill-defined Sites",
-    "long bones of lower limb and associated joints" = "Bone",
-    "connective subcutaneous and other soft tissues of thorax" = "Soft Tissue",
-    "floor of mouth nos" = "Head and Neck",
-    "upper limb nos" = "Other and Ill-defined Sites",
-    "rectosigmoid junction" = "Colorectal",
-    "paraspinal" = "Other and Ill-defined Sites",
-    "cheek mucosa" = "Head and Neck",
-    "skin of trunk" = "Skin",
-    "skin of lower limb and hip" = "Skin",
-    "long bones of upper limb scapula and associated joints" = "Bone",
-    "anterior 2/3 of tongue nos" = "Head and Neck",
-    "connective subcutaneous and other soft tissues of lower limb and hip" = "Soft Tissue",
-    "transverse colon" = "Colorectal",
-    "retromolar area" = "Head and Neck",
-    "connective subcutaneous and other soft tissues of trunk nos" = "Soft Tissue",
-    "larynx nos" = "Head and Neck",
-    "sigmoid colon" = "Colorectal",
-    "vulva nos" = "Other and Ill-defined Sites",
-    "connective subcutaneous and other soft tissues nos" = "Soft Tissue",
-    "connective subcutaneous and other soft tissues of abdomen" = "Soft Tissue",
-    "cerebellum nos" = "Brain",
-    "parietal lobe" = "Brain",
-    "temporal lobe" = "Brain"
-  ) |>
-    enframe(name = "tissue", value = "tissue_groups") |>
-    unnest(tissue_groups) |>
-    distinct()
-}
-
-x |> left_join(get_tissue_lookup(), copy=T) |> count(tissue_groups) |> arrange(desc(n))
 
 

@@ -1,4 +1,3 @@
-# Save cpm, rank, sct
 library(targets)
 library(tidyverse)
 store_file_cellNexus = "/vast/scratch/users/shen.m/htan/hta/targets_run_pseudobulk"
@@ -171,7 +170,8 @@ tar_script({
       mutate(
         sce = bplapply(
           target_name,
-          FUN = function(x) tar_read_raw(x, store = my_store),
+          FUN = function(x) tar_read_raw(x, store = my_store) |>
+            mutate(sample_id = stringr::str_remove(sample_id, ".h5ad")),
           BPPARAM = bp
         )
       ) |>
@@ -235,11 +235,11 @@ tar_script({
   list(
     
     # The input DO NOT DELETE
-    tar_target(my_store, "/vast/scratch/users/shen.m/hta_lung_run_hpcell_target_store", deployment = "main"), # MODIFY HERE: HPCell targets store to read SCEs from
-    tar_target(cache_directory, "/vast/scratch/users/shen.m/htan/hta_2025/0.1.0/pseudobulk", deployment = "main"), # MODIFY HERE: output cache directory for saved anndata files
+    tar_target(my_store, "/vast/scratch/users/shen.m/hta_all_centers_run_hpcell_target_store", deployment = "main"), # MODIFY HERE: HPCell targets store to read SCEs from
+    tar_target(cache_directory, "/vast/scratch/users/shen.m/htan/hta_2026/0.4.0/pseudobulk", deployment = "main"), # MODIFY HERE: output cache directory for saved anndata files
     tar_target(
       cell_metadata,
-      "/vast/projects/cellxgene_curated/hta/metadata_hta_lung.v0.1.0.parquet", # MODIFY HERE: final metadata parquet (should match the COPY TO output above)
+      "/vast/projects/cellxgene_curated/hta/hta_2026.v0.2.0.parquet", # MODIFY HERE: final metadata parquet (should match the COPY TO output above)
       packages = c( "arrow","dplyr","duckdb")
       
     ),
@@ -302,12 +302,12 @@ job::job({
   )
   
 })
-# tar_workspace(sample_id_sce_57f89462305fac5b,store=store_file_cellNexus)
+# tar_workspace(saved_pseudobulk_112ddbbb1e66e8c4,store=store_file_cellNexus)
 # debugonce(cbind_sce_by_dataset_id)
 # cbind_sce_by_dataset_id(target_name_grouped_by_sample_id, cell_metadata, my_store)
 # tar_invalidate(target_name_grouped_by_sample_id, store =store_file_cellNexus)
 
-x = get_metadata(cloud_metadata = NULL, local_metadata = "/vast/projects/cellxgene_curated/hta/metadata_hta_lung.v0.1.0.parquet")
+x = get_metadata(cloud_metadata = NULL, local_metadata = "/vast/projects/cellxgene_curated/hta/hta_2026.v0.2.0.parquet")
 
 pb= x |> keep_quality_cells() |> 
 #   # FOR TESTING PURPOSE ONLY
@@ -372,4 +372,8 @@ pb = scuttle::logNormCounts(pb)
 
 # Plot
 plot_pseudobulk_boxplot(pb, top_n = 10, cell_type_col = "cell_type_unified_ensemble")
+ggsave("/home/users/allstaff/shen.m/git_control/HumanTumourAtlas/logNorm_pb_boxplot_by_celltype_ensemble.png", 
+       plot = last_plot(),
+       width = 17,
+       height = 8)
 
